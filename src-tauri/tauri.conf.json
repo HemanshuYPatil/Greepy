@@ -17,7 +17,7 @@
         "height": 600,
         "fullscreen": false,
         "maximized": true,
-        "decorations": true
+        "decorations": false
       }
     ],
     "security": {

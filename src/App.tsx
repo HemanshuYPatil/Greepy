@@ -23,6 +23,7 @@ type Pane = {
 type ShortcutSettings = {
   splitHorizontalKey: string;
   splitVerticalKey: string;
+  imageDropFormat: "single-line" | "separate-lines";
 };
 
 type RecentProject = {
@@ -82,12 +83,20 @@ type WorkspaceSetupForm = {
 type WorkspaceSetupMode = "active-tab" | "new-tab";
 type SettingsSection = "appearance" | "controls" | "workspace" | "updates";
 type AppTheme =
+  | "carbon-black"
+  | "onyx-terminal"
+  | "void-slate"
   | "obsidian"
   | "neon-noir"
   | "ember-graphite"
   | "ocean-steel"
   | "forest-night";
-type AppLayout = "clean" | "compact" | "spacious";
+type AppLayout =
+  | "clean"
+  | "compact"
+  | "spacious"
+  | "terminal-dense"
+  | "focus-wide";
 
 type AppearanceSettings = {
   appTheme: AppTheme;
@@ -108,6 +117,7 @@ type UpdaterSettings = {
 const DEFAULT_SHORTCUTS: ShortcutSettings = {
   splitHorizontalKey: "d",
   splitVerticalKey: "b",
+  imageDropFormat: "single-line",
 };
 
 const normalizeShortcutKey = (value: string) =>
@@ -140,7 +150,7 @@ const AGENT_OPTIONS: AgentOption[] = [
 ];
 
 const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
-  appTheme: "obsidian",
+  appTheme: "carbon-black",
   appLayout: "clean",
   activityMotion: "fast",
   closeButtonMode: "hover",
@@ -192,6 +202,99 @@ const getFolderName = (path: string) => {
   if (!trimmed) return "";
   const segments = trimmed.split(/[\\/]/).filter(Boolean);
   return segments[segments.length - 1] ?? "";
+};
+
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "gif",
+  "bmp",
+  "svg",
+  "heic",
+  "heif",
+  "tif",
+  "tiff",
+  "avif",
+  "ico",
+]);
+
+const hasImageExtension = (value: string) => {
+  const clean = value.split("?")[0].split("#")[0];
+  const dotIndex = clean.lastIndexOf(".");
+  if (dotIndex < 0) return false;
+  const extension = clean.slice(dotIndex + 1).trim().toLowerCase();
+  return IMAGE_EXTENSIONS.has(extension);
+};
+
+const isImageCandidate = (value: string, mimeType?: string) => {
+  if (mimeType && mimeType.startsWith("image/")) return true;
+  return hasImageExtension(value);
+};
+
+const formatDroppedPath = (path: string) => {
+  if (!/\s/.test(path)) return path;
+  return `"${path.replace(/"/g, '\\"')}"`;
+};
+
+const unwrapQuotedPath = (value: string) => {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+};
+
+const extractImagePathsFromClipboardText = (value: string) => {
+  const rows = value
+    .split(/\r?\n/)
+    .map((entry) => unwrapQuotedPath(entry))
+    .filter(Boolean);
+  if (!rows.length) return [];
+  if (!rows.every((entry) => isImageCandidate(entry))) return [];
+  return rows;
+};
+
+const buildImagePathPayload = (
+  paths: string[],
+  mode: ShortcutSettings["imageDropFormat"],
+) => {
+  const formattedPaths = paths.map(formatDroppedPath);
+  if (mode === "separate-lines") return `${formattedPaths.join("\n")}\n`;
+  return `${formattedPaths.join(" ")} `;
+};
+
+const toCssDropPoints = (point: { x: number; y: number }) => {
+  const dpr = window.devicePixelRatio || 1;
+  const candidates = [{ x: point.x, y: point.y }];
+  if (Math.abs(dpr - 1) > 0.01) {
+    candidates.push({ x: point.x / dpr, y: point.y / dpr });
+  }
+  return candidates.filter(
+    (candidate) =>
+      candidate.x >= 0 &&
+      candidate.y >= 0 &&
+      candidate.x < window.innerWidth &&
+      candidate.y < window.innerHeight,
+  );
+};
+
+const resolveDropTargetPaneId = (point: { x: number; y: number }) => {
+  const candidates = toCssDropPoints(point);
+  for (const candidate of candidates) {
+    const hit = document.elementFromPoint(candidate.x, candidate.y) as HTMLElement | null;
+    if (!hit) continue;
+    const tile = hit.closest<HTMLElement>("[data-pane-id]");
+    if (!tile) continue;
+    const surface = tile.closest(".tab-surface");
+    if (surface && surface.classList.contains("hidden")) continue;
+    return tile.dataset.paneId ?? null;
+  }
+  return null;
 };
 
 const createDefaultAllocations = (): Record<string, AgentAllocation> => ({
@@ -306,8 +409,13 @@ const loadShortcuts = (): ShortcutSettings => {
     const splitVerticalKey = normalizeShortcutKey(
       parsed.splitVerticalKey ?? DEFAULT_SHORTCUTS.splitVerticalKey,
     );
+    const imageDropFormat =
+      parsed.imageDropFormat === "separate-lines" ||
+      parsed.imageDropFormat === "single-line"
+        ? parsed.imageDropFormat
+        : DEFAULT_SHORTCUTS.imageDropFormat;
     if (!splitHorizontalKey || !splitVerticalKey) return DEFAULT_SHORTCUTS;
-    return { splitHorizontalKey, splitVerticalKey };
+    return { splitHorizontalKey, splitVerticalKey, imageDropFormat };
   } catch {
     return DEFAULT_SHORTCUTS;
   }
@@ -325,6 +433,9 @@ const loadAppearanceSettings = (): AppearanceSettings => {
   try {
     const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
     const appTheme =
+      parsed.appTheme === "carbon-black" ||
+      parsed.appTheme === "onyx-terminal" ||
+      parsed.appTheme === "void-slate" ||
       parsed.appTheme === "obsidian" ||
       parsed.appTheme === "neon-noir" ||
       parsed.appTheme === "ember-graphite" ||
@@ -333,6 +444,8 @@ const loadAppearanceSettings = (): AppearanceSettings => {
         ? parsed.appTheme
         : DEFAULT_APPEARANCE_SETTINGS.appTheme;
     const appLayout =
+      parsed.appLayout === "terminal-dense" ||
+      parsed.appLayout === "focus-wide" ||
       parsed.appLayout === "compact" ||
       parsed.appLayout === "spacious" ||
       parsed.appLayout === "clean"
@@ -462,6 +575,7 @@ type TerminalPaneProps = {
   activityVariant: number;
   layoutTick: number;
   isActive: boolean;
+  isDropTarget: boolean;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
   canClose: boolean;
@@ -475,6 +589,7 @@ function TerminalPane({
   activityVariant,
   layoutTick,
   isActive,
+  isDropTarget,
   onSelect,
   onClose,
   canClose,
@@ -494,6 +609,7 @@ function TerminalPane({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isAgentWorking, setIsAgentWorking] = useState(false);
+  const lastInsertRef = useRef<{ payload: string; at: number }>({ payload: "", at: 0 });
   const activityPalette = useMemo(() => createActivityPalette(activityVariant), [activityVariant]);
   const activityVariantStyle = useMemo(
     () =>
@@ -517,6 +633,18 @@ function TerminalPane({
     if (isWorkingRef.current === next) return;
     isWorkingRef.current = next;
     setIsAgentWorking(next);
+  };
+
+  const writeDedupedPayload = (payload: string) => {
+    const now = Date.now();
+    if (
+      lastInsertRef.current.payload === payload &&
+      now - lastInsertRef.current.at < 280
+    ) {
+      return;
+    }
+    lastInsertRef.current = { payload, at: now };
+    void invoke("pty_write", { id, data: payload });
   };
 
   const hasInterruptSignal = () => {
@@ -580,6 +708,7 @@ function TerminalPane({
 
     const setup = async () => {
       if (!containerRef.current) return;
+      const container = containerRef.current;
 
       const term = new Terminal({
         fontFamily:
@@ -596,7 +725,7 @@ function TerminalPane({
 
       const fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
-      term.open(containerRef.current);
+      term.open(container);
       requestAnimationFrame(() => {
         fitAddon.fit();
       });
@@ -669,21 +798,32 @@ function TerminalPane({
 
       pasteHandler = (event: ClipboardEvent) => {
         event.preventDefault();
+        event.stopPropagation();
         void (async () => {
+          const writeClipboardText = async (text: string) => {
+            const imagePaths = extractImagePathsFromClipboardText(text);
+            if (imagePaths.length > 0) {
+              // Always use single-image style for multi-image paste.
+              writeDedupedPayload(buildImagePathPayload(imagePaths, "single-line"));
+              return;
+            }
+            writeDedupedPayload(text);
+          };
+
           try {
             const text = await readClipboardText();
             if (text) {
-              await invoke("pty_write", { id, data: text });
+              await writeClipboardText(text);
             }
           } catch {
             const text = event.clipboardData?.getData("text");
             if (!text) return;
-            await invoke("pty_write", { id, data: text });
+            await writeClipboardText(text);
           }
         })();
       };
 
-      containerRef.current.addEventListener("paste", pasteHandler);
+      container.addEventListener("paste", pasteHandler);
 
       unlisten = await listen<PtyDataEvent>("pty:data", (event) => {
         if (event.payload.id === id) {
@@ -706,7 +846,7 @@ function TerminalPane({
 
       if (typeof ResizeObserver !== "undefined") {
         resizeObserver = new ResizeObserver(handleResize);
-        resizeObserver.observe(containerRef.current);
+        resizeObserver.observe(container);
       } else {
         windowResizeHandler = handleResize;
         window.addEventListener("resize", windowResizeHandler);
@@ -749,6 +889,7 @@ function TerminalPane({
       awaitingResponseRef.current = false;
       lastOutputAtRef.current = 0;
       lastBusySignalAtRef.current = 0;
+      lastInsertRef.current = { payload: "", at: 0 };
       setWorkingState(false);
       void invoke("pty_close", { id });
     };
@@ -778,7 +919,11 @@ function TerminalPane({
   }, [layoutTick, id]);
 
   return (
-    <div className={`tile ${isActive ? "active" : ""}`} onClick={handleTileClick}>
+    <div
+      className={`tile ${isActive ? "active" : ""} ${isDropTarget ? "drop-target" : ""}`}
+      data-pane-id={id}
+      onClick={handleTileClick}
+    >
       <div className="tile-status-bar">
         <div className={`tile-activity ${isAgentWorking ? "working" : ""}`} style={activityVariantStyle as any}>
           <span className="activity-wave" />
@@ -811,7 +956,15 @@ function TerminalPane({
           <span>{error}</span>
         </div>
       )}
-      <div className="terminal-shell" ref={containerRef} />
+      <div className="terminal-shell-wrap">
+        <div className="terminal-shell" ref={containerRef} />
+        <div className={`terminal-drop-overlay ${isDropTarget ? "visible" : ""}`} aria-hidden="true">
+          <div className="terminal-drop-overlay-inner">
+            <span className="terminal-drop-overlay-title">Drop Images Here</span>
+            <span className="terminal-drop-overlay-subtitle">Only this terminal receives the paste</span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1132,7 +1285,13 @@ function MainApp() {
     shortcuts,
   );
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [dropTargetPaneId, setDropTargetPaneId] = useState<string | null>(null);
+  const [isImageDragActive, setIsImageDragActive] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const dropImageActiveRef = useRef(false);
+  const lastGlobalDropRef = useRef<{ paneId: string; payload: string; at: number } | null>(
+    null,
+  );
   const [lastSplit, setLastSplit] = useState<"horizontal" | "vertical">(
     "horizontal",
   );
@@ -1161,6 +1320,71 @@ function MainApp() {
       document.removeEventListener("keydown", handleKey);
     };
   }, [isMenuOpen]);
+
+  useEffect(() => {
+    let unlistenDragDrop: (() => void) | null = null;
+    const writeDroppedImages = (paneId: string, imagePaths: string[]) => {
+      const payload = buildImagePathPayload(imagePaths, shortcuts.imageDropFormat);
+      const now = Date.now();
+      const previous = lastGlobalDropRef.current;
+      if (
+        previous &&
+        previous.paneId === paneId &&
+        previous.payload === payload &&
+        now - previous.at < 280
+      ) {
+        return;
+      }
+      lastGlobalDropRef.current = { paneId, payload, at: now };
+      setActiveId(paneId);
+      void invoke("pty_write", { id: paneId, data: payload });
+    };
+
+    const setup = async () => {
+      unlistenDragDrop = await appWindow.onDragDropEvent((event) => {
+        const payload = event.payload;
+        const targetPaneId =
+          payload.type === "leave" ? null : resolveDropTargetPaneId(payload.position);
+
+        if (payload.type === "leave") {
+          dropImageActiveRef.current = false;
+          setIsImageDragActive(false);
+          setDropTargetPaneId(null);
+          return;
+        }
+
+        if (payload.type === "enter") {
+          const hasImage = payload.paths.some((path) => isImageCandidate(path));
+          dropImageActiveRef.current = hasImage;
+          setIsImageDragActive(hasImage);
+          setDropTargetPaneId(hasImage ? targetPaneId : null);
+          return;
+        }
+
+        if (payload.type === "over") {
+          setDropTargetPaneId(dropImageActiveRef.current ? targetPaneId : null);
+          return;
+        }
+
+        if (payload.type === "drop") {
+          const imagePaths = payload.paths.filter((path) => isImageCandidate(path));
+          dropImageActiveRef.current = false;
+          setIsImageDragActive(false);
+          setDropTargetPaneId(null);
+          if (!targetPaneId || !imagePaths.length) return;
+          writeDroppedImages(targetPaneId, imagePaths);
+        }
+      });
+    };
+
+    void setup();
+    return () => {
+      if (unlistenDragDrop) unlistenDragDrop();
+      dropImageActiveRef.current = false;
+      setIsImageDragActive(false);
+      setDropTargetPaneId(null);
+    };
+  }, [appWindow, shortcuts.imageDropFormat]);
 
   const buildSnapshot = (
     nextProjectPath: string,
@@ -1858,11 +2082,18 @@ function MainApp() {
   };
 
   const handleShortcutChange = (
-    field: keyof ShortcutSettings,
+    field: "splitHorizontalKey" | "splitVerticalKey",
     value: string,
   ) => {
     const next = { ...draftShortcuts, [field]: normalizeShortcutKey(value) };
     setDraftShortcuts(next);
+    setShortcutError(null);
+  };
+
+  const handleImageDropFormatChange = (
+    value: ShortcutSettings["imageDropFormat"],
+  ) => {
+    setDraftShortcuts((current) => ({ ...current, imageDropFormat: value }));
     setShortcutError(null);
   };
 
@@ -1887,7 +2118,11 @@ function MainApp() {
       return;
     }
 
-    const next = { splitHorizontalKey, splitVerticalKey };
+    const imageDropFormat: ShortcutSettings["imageDropFormat"] =
+      draftShortcuts.imageDropFormat === "separate-lines"
+        ? "separate-lines"
+        : "single-line";
+    const next = { splitHorizontalKey, splitVerticalKey, imageDropFormat };
     setShortcuts(next);
     saveShortcuts(next);
     closeSettings();
@@ -2363,11 +2598,63 @@ function MainApp() {
   const closeModeClass =
     appearanceSettings.closeButtonMode === "always" ? "close-dot-always" : "";
 
+  const handleWindowClose = () => {
+    void appWindow.close();
+  };
+
+  const handleWindowMinimize = () => {
+    void appWindow.minimize();
+  };
+
+  const handleWindowZoom = () => {
+    void (async () => {
+      const maximized = await appWindow.isMaximized();
+      if (maximized) {
+        await appWindow.unmaximize();
+        return;
+      }
+      await appWindow.maximize();
+    })();
+  };
+
+  const windowControls = (
+    <div className="topbar-window-controls" aria-label="Window controls">
+      <button
+        className="window-control-btn close"
+        onClick={handleWindowClose}
+        aria-label="Close window"
+        title="Close"
+      >
+        <span className="window-control-glyph">×</span>
+      </button>
+      <button
+        className="window-control-btn minimize"
+        onClick={handleWindowMinimize}
+        aria-label="Minimize window"
+        title="Minimize"
+      >
+        <span className="window-control-glyph">−</span>
+      </button>
+      <button
+        className="window-control-btn zoom"
+        onClick={handleWindowZoom}
+        aria-label="Maximize window"
+        title="Zoom"
+      >
+        <span className="window-control-glyph">+</span>
+      </button>
+    </div>
+  );
+
   if (!isProjectReady) {
     return (
       <div
         className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
       >
+        <header className="topbar startup-topbar">
+          {windowControls}
+          <div className="topbar-drag-zone startup" data-tauri-drag-region />
+        </header>
         <div className="project-screen">
           <div className="project-shell">
             <div className="project-header">
@@ -2506,6 +2793,7 @@ function MainApp() {
       className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
     >
       <header className="topbar">
+        {windowControls}
         <div className="topbar-tabs">
           {tabs.map((tab) => (
             <div
@@ -2541,7 +2829,7 @@ function MainApp() {
             +
           </button>
         </div>
-        <div className="topbar-drag-zone" />
+        <div className="topbar-drag-zone" data-tauri-drag-region />
         <div className="topbar-menu" ref={menuRef}>
           <button
             className="btn secondary"
@@ -2642,6 +2930,7 @@ function MainApp() {
                   activityVariant={getNextActivityVariant()}
                   layoutTick={layoutTick}
                   isActive={isTabActive && pane.id === activeId}
+                  isDropTarget={isTabActive && isImageDragActive && dropTargetPaneId === pane.id}
                   onSelect={isTabActive ? (id) => setActiveId(id) : () => undefined}
                   onClose={isTabActive ? handleClose : () => undefined}
                   canClose={isTabActive && tabPanes.length > 1}
@@ -2708,6 +2997,9 @@ function MainApp() {
                           }))
                         }
                       >
+                        <option value="carbon-black">Carbon Black (Default)</option>
+                        <option value="onyx-terminal">Onyx Terminal</option>
+                        <option value="void-slate">Void Slate</option>
                         <option value="obsidian">Obsidian Flux</option>
                         <option value="neon-noir">Neon Noir</option>
                         <option value="ember-graphite">Ember Graphite</option>
@@ -2726,9 +3018,11 @@ function MainApp() {
                           }))
                         }
                       >
+                        <option value="terminal-dense">Terminal Dense</option>
                         <option value="clean">Clean</option>
                         <option value="compact">Compact</option>
                         <option value="spacious">Spacious</option>
+                        <option value="focus-wide">Focus Wide</option>
                       </select>
                     </label>
                     <div className="settings-card">
@@ -2782,7 +3076,7 @@ function MainApp() {
                   <div className="settings-section">
                     <div className="settings-section-title">Controls</div>
                     <div className="settings-section-subtitle">
-                      Configure split shortcuts used inside the terminal grid.
+                      Configure split shortcuts and image drop behavior.
                     </div>
                     <label className="field settings-field">
                       <span>Split horizontal</span>
@@ -2816,6 +3110,23 @@ function MainApp() {
                         />
                       </div>
                     </label>
+                    <label className="field settings-field">
+                      <span>Image drop format</span>
+                      <select
+                        value={draftShortcuts.imageDropFormat}
+                        onChange={(event) =>
+                          handleImageDropFormatChange(
+                            event.target.value as ShortcutSettings["imageDropFormat"],
+                          )
+                        }
+                      >
+                        <option value="single-line">Single line</option>
+                        <option value="separate-lines">Separate lines</option>
+                      </select>
+                    </label>
+                    <div className="field-hint">
+                      Multiple dropped images can be inserted in one line or one path per line.
+                    </div>
                     {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
                     draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (
                       <div className="field-hint">
