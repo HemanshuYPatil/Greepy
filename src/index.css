@@ -75,9 +75,9 @@ body {
 .topbar-tabs {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
-  max-width: 56vw;
+  max-width: 62vw;
   overflow-x: auto;
 }
 
@@ -87,11 +87,11 @@ body {
   border: 1px solid var(--border);
   background: #101010;
   color: var(--muted);
-  height: 30px;
-  min-width: 96px;
-  max-width: 220px;
+  height: 36px;
+  min-width: 128px;
+  max-width: 260px;
   padding: 0;
-  font-size: 11px;
+  font-size: 12px;
   white-space: nowrap;
   font-family: inherit;
 }
@@ -109,9 +109,9 @@ body {
   background: transparent;
   color: inherit;
   font-family: inherit;
-  font-size: 11px;
+  font-size: 12px;
   text-align: left;
-  padding: 0 10px;
+  padding: 0 12px;
   cursor: pointer;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -119,14 +119,14 @@ body {
 }
 
 .topbar-tab-close {
-  width: 22px;
-  min-width: 22px;
+  width: 28px;
+  min-width: 28px;
   height: 100%;
   border: none;
   border-left: 1px solid var(--border);
   background: transparent;
   color: inherit;
-  font-size: 13px;
+  font-size: 15px;
   cursor: pointer;
 }
 
@@ -142,11 +142,11 @@ body {
   border: 1px solid var(--border);
   background: #101010;
   color: var(--muted);
-  min-width: 30px;
-  width: 30px;
-  max-width: 30px;
+  min-width: 36px;
+  width: 36px;
+  max-width: 36px;
   padding: 0;
-  font-size: 16px;
+  font-size: 18px;
   cursor: pointer;
 }
 
@@ -284,31 +284,87 @@ body {
   opacity: 1;
 }
 
-.tile-header {
-  display: flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.tile-title {
+.tile-activity {
+  position: relative;
   width: 100%;
-  background: transparent;
-  border: none;
-  color: var(--muted);
-  font-size: 10px;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  font-family: inherit;
+  height: 7px;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+  contain: paint;
+  border-radius: 999px;
+  transform: translateZ(0);
 }
 
-.tile-title:focus {
-  outline: none;
-  color: var(--text);
+.activity-wave {
+  position: absolute;
+  top: 50%;
+  height: 3px;
+  width: 100%;
+  left: 0;
+  background:
+    linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(126, 69, 255, 0.08) 6%,
+      rgba(166, 87, 255, 0.54) 24%,
+      rgba(252, 103, 227, 0.95) 42%,
+      rgba(214, 120, 255, 1) 58%,
+      rgba(146, 92, 255, 0.62) 78%,
+      rgba(120, 74, 255, 0.12) 94%,
+      transparent 100%
+    );
+  background-size: 240% 100%;
+  background-position: -140% 50%;
+  transform: translate3d(0, -50%, 0);
+  filter:
+    drop-shadow(0 0 5px rgba(229, 120, 255, 0.72))
+    drop-shadow(0 0 10px rgba(166, 95, 255, 0.46));
+  opacity: 0;
+  will-change: background-position, opacity;
 }
 
-.tile.active .tile-title {
-  color: var(--text);
+.tile-activity.working {
+  opacity: 1;
+  filter: saturate(1.35);
+}
+
+.tile-activity.working .activity-wave {
+  animation: terminal-activity-wave 0.92s linear infinite;
+}
+
+.activity-wave.secondary {
+  width: 100%;
+  left: 0;
+  opacity: 0.5;
+  background:
+    linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(180, 91, 255, 0.06) 4%,
+      rgba(255, 102, 196, 0.42) 26%,
+      rgba(157, 118, 255, 0.9) 50%,
+      rgba(255, 120, 216, 0.42) 74%,
+      rgba(182, 98, 255, 0.08) 96%,
+      transparent 100%
+    );
+  background-size: 270% 100%;
+  background-position: -160% 50%;
+  filter:
+    drop-shadow(0 0 4px rgba(255, 117, 227, 0.58))
+    drop-shadow(0 0 8px rgba(151, 91, 255, 0.36));
+  animation-duration: 0.78s;
+  animation-delay: -0.22s;
+}
+
+.tile-status-bar {
+  height: 24px;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 52px 9px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .tile.active {
@@ -318,7 +374,7 @@ body {
 
 .tile-actions {
   position: absolute;
-  top: 8px;
+  top: 2px;
   right: 8px;
   z-index: 3;
   display: flex;
@@ -1088,5 +1144,16 @@ body {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes terminal-activity-wave {
+  0% {
+    background-position: -160% 50%;
+    opacity: 0.82;
+  }
+  100% {
+    background-position: 170% 50%;
+    opacity: 0.82;
   }
 }

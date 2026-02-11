@@ -111,6 +111,13 @@ const AGENT_OPTIONS: AgentOption[] = [
   { id: "gemini", label: "Gemini", defaultCommand: "gemini" },
   { id: "custom", label: "Custom", defaultCommand: "" },
 ];
+const AGENT_LABELS = AGENT_OPTIONS.map((option) => option.label.toLowerCase());
+
+const isAgentPaneName = (name: string) => {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) return false;
+  return AGENT_LABELS.some((label) => normalized.includes(label));
+};
 
 const getGridLayout = (id: string) =>
   GRID_LAYOUT_OPTIONS.find((option) => option.id === id) ?? GRID_LAYOUT_OPTIONS[0];
@@ -211,6 +218,19 @@ const sanitizeLog = (value: string) => {
   return withoutAnsi;
 };
 
+const AGENT_STREAM_IDLE_MS = 1200;
+const AGENT_BUSY_GRACE_MS = 1900;
+const AGENT_RECHECK_MS = Math.max(AGENT_STREAM_IDLE_MS, AGENT_BUSY_GRACE_MS) + 120;
+const AGENT_BUSY_TEXT_PATTERN = /\b(thinking|analyzing|processing|generating|executing|running)\b/i;
+
+const hasBusySignalInChunk = (chunk: string) => {
+  const normalized = sanitizeLog(chunk).toLowerCase();
+  if (!normalized.trim() && !chunk.includes("\r")) return false;
+  if (normalized.includes("esc to interrupt")) return true;
+  if (AGENT_BUSY_TEXT_PATTERN.test(normalized)) return true;
+  return chunk.includes("\r") && !chunk.includes("\n");
+};
+
 const loadShortcuts = (): ShortcutSettings => {
   if (typeof window === "undefined") return DEFAULT_SHORTCUTS;
   const raw = window.localStorage.getItem("greepy.shortcuts");
@@ -260,8 +280,7 @@ const createPane = (index: number): Pane => ({
 
 type TerminalPaneProps = {
   id: string;
-  name: string;
-  onRename: (id: string, name: string) => void;
+  isAgentPane: boolean;
   layoutTick: number;
   isActive: boolean;
   onSelect: (id: string) => void;
@@ -274,8 +293,7 @@ type TerminalPaneProps = {
 
 function TerminalPane({
   id,
-  name,
-  onRename,
+  isAgentPane,
   layoutTick,
   isActive,
   onSelect,
@@ -288,12 +306,82 @@ function TerminalPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const isWorkingRef = useRef(false);
+  const awaitingResponseRef = useRef(false);
+  const lastOutputAtRef = useRef(0);
+  const lastBusySignalAtRef = useRef(0);
+  const signalSyncRafRef = useRef<number | null>(null);
+  const signalSyncTimeoutRef = useRef<number | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isAgentWorking, setIsAgentWorking] = useState(false);
 
   const handleTileClick = () => {
     onSelect(id);
     termRef.current?.focus();
+  };
+
+  const setWorkingState = (next: boolean) => {
+    if (isWorkingRef.current === next) return;
+    isWorkingRef.current = next;
+    setIsAgentWorking(next);
+  };
+
+  const hasInterruptSignal = () => {
+    if (!isAgentPane) return false;
+    const term = termRef.current;
+    if (!term) return false;
+
+    const buffer = term.buffer.active;
+    const marker = "esc to interrupt";
+    const viewportStart = Math.max(0, buffer.viewportY - 1);
+    const viewportEnd = Math.min(buffer.length - 1, buffer.viewportY + term.rows + 1);
+    const visibleText: string[] = [];
+
+    for (let lineIndex = viewportStart; lineIndex <= viewportEnd; lineIndex += 1) {
+      const line = buffer.getLine(lineIndex)?.translateToString(true).toLowerCase() ?? "";
+      if (line.includes(marker)) return true;
+      visibleText.push(line);
+    }
+
+    // Covers wrapped markers split across two visible lines.
+    return visibleText.join(" ").includes(marker);
+  };
+
+  const syncWorkingFromTerminal = () => {
+    if (!isAgentPane) {
+      setWorkingState(false);
+      return;
+    }
+    const now = Date.now();
+    const hasInterruptMarker = hasInterruptSignal();
+    const hasRecentBusySignal = now - lastBusySignalAtRef.current < AGENT_BUSY_GRACE_MS;
+    const hasRecentOutput =
+      awaitingResponseRef.current && now - lastOutputAtRef.current < AGENT_STREAM_IDLE_MS;
+
+    if (!hasInterruptMarker && awaitingResponseRef.current && !hasRecentOutput) {
+      awaitingResponseRef.current = false;
+    }
+
+    setWorkingState(hasInterruptMarker || hasRecentBusySignal || hasRecentOutput);
+  };
+
+  const scheduleSignalSync = () => {
+    if (signalSyncRafRef.current !== null) return;
+    signalSyncRafRef.current = window.requestAnimationFrame(() => {
+      signalSyncRafRef.current = null;
+      syncWorkingFromTerminal();
+    });
+  };
+
+  const scheduleDelayedSignalSync = () => {
+    if (signalSyncTimeoutRef.current !== null) {
+      window.clearTimeout(signalSyncTimeoutRef.current);
+    }
+    signalSyncTimeoutRef.current = window.setTimeout(() => {
+      signalSyncTimeoutRef.current = null;
+      syncWorkingFromTerminal();
+    }, AGENT_RECHECK_MS);
   };
 
   useEffect(() => {
@@ -379,6 +467,19 @@ function TerminalPane({
 
       term.onData((data) => {
         void invoke("pty_write", { id, data });
+        if (!isAgentPane) return;
+
+        const now = Date.now();
+        if (data.includes("\u0003")) {
+          awaitingResponseRef.current = false;
+          lastBusySignalAtRef.current = 0;
+        } else if (data.includes("\r")) {
+          awaitingResponseRef.current = true;
+          lastOutputAtRef.current = now;
+        }
+
+        scheduleSignalSync();
+        scheduleDelayedSignalSync();
       });
 
       pasteHandler = (event: ClipboardEvent) => {
@@ -403,6 +504,15 @@ function TerminalPane({
         if (event.payload.id === id) {
           setIsLoading(false);
           term.write(event.payload.data);
+          if (isAgentPane) {
+            const now = Date.now();
+            lastOutputAtRef.current = now;
+            if (hasBusySignalInChunk(event.payload.data)) {
+              lastBusySignalAtRef.current = now;
+            }
+            scheduleDelayedSignalSync();
+          }
+          scheduleSignalSync();
         }
       });
 
@@ -442,12 +552,24 @@ function TerminalPane({
       if (pasteHandler && containerRef.current) {
         containerRef.current.removeEventListener("paste", pasteHandler);
       }
+      if (signalSyncRafRef.current !== null) {
+        window.cancelAnimationFrame(signalSyncRafRef.current);
+        signalSyncRafRef.current = null;
+      }
+      if (signalSyncTimeoutRef.current !== null) {
+        window.clearTimeout(signalSyncTimeoutRef.current);
+        signalSyncTimeoutRef.current = null;
+      }
       if (termRef.current) termRef.current.dispose();
       termRef.current = null;
       fitRef.current = null;
+      awaitingResponseRef.current = false;
+      lastOutputAtRef.current = 0;
+      lastBusySignalAtRef.current = 0;
+      setWorkingState(false);
       void invoke("pty_close", { id });
     };
-  }, [id, cwd]);
+  }, [id, cwd, isAgentPane]);
 
   useEffect(() => {
     if (isActive) {
@@ -474,13 +596,13 @@ function TerminalPane({
 
   return (
     <div className={`tile ${isActive ? "active" : ""}`} onClick={handleTileClick}>
-      <div className="tile-header">
-        <input
-          className="tile-title"
-          value={name}
-          onChange={(event) => onRename(id, event.target.value)}
-          onClick={(event) => event.stopPropagation()}
-        />
+      <div className="tile-status-bar">
+        {isAgentPane && (
+          <div className={`tile-activity ${isAgentWorking ? "working" : ""}`}>
+            <span className="activity-wave" />
+            <span className="activity-wave secondary" />
+          </div>
+        )}
       </div>
       <div className="tile-actions">
         <button
@@ -1510,12 +1632,6 @@ function MainApp() {
     });
   };
 
-  const handleRename = (id: string, name: string) => {
-    setPanes((current) =>
-      current.map((pane) => (pane.id === id ? { ...pane, name } : pane)),
-    );
-  };
-
   const handleRunCommand = async (command: string) => {
     if (!isProjectReady || !activeId) return;
     await invoke("pty_write", { id: activeId, data: `${command}\r` });
@@ -2219,8 +2335,7 @@ function MainApp() {
                 <TerminalPane
                   key={pane.id}
                   id={pane.id}
-                  name={pane.name}
-                  onRename={isTabActive ? handleRename : () => undefined}
+                  isAgentPane={isAgentPaneName(pane.name)}
                   layoutTick={layoutTick}
                   isActive={isTabActive && pane.id === activeId}
                   onSelect={isTabActive ? (id) => setActiveId(id) : () => undefined}
