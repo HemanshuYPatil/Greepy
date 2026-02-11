@@ -80,6 +80,21 @@ type WorkspaceSetupForm = {
 };
 
 type WorkspaceSetupMode = "active-tab" | "new-tab";
+type SettingsSection = "appearance" | "controls" | "workspace" | "updates";
+
+type AppearanceSettings = {
+  activityMotion: "fast" | "balanced" | "slow";
+  closeButtonMode: "hover" | "always";
+};
+
+type WorkspacePreferences = {
+  defaultWorkspaceName: string;
+  defaultGridLayoutId: string;
+};
+
+type UpdaterSettings = {
+  githubToken: string;
+};
 
 const DEFAULT_SHORTCUTS: ShortcutSettings = {
   splitHorizontalKey: "d",
@@ -94,6 +109,9 @@ const MAX_RECENTS = 6;
 const SESSION_KEY = "greepy.lastSession";
 const SERVERS_KEY = "greepy.projectServers";
 const LAST_PROJECT_KEY = "greepy.lastProject";
+const APPEARANCE_SETTINGS_KEY = "greepy.appearanceSettings";
+const WORKSPACE_PREFERENCES_KEY = "greepy.workspacePreferences";
+const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
 const DEFAULT_GRID_LAYOUT_ID = "grid-2x2";
 const GRID_LAYOUT_OPTIONS: GridLayoutOption[] = [
   { id: "grid-1", label: "1", rows: 1, cols: 1 },
@@ -111,13 +129,47 @@ const AGENT_OPTIONS: AgentOption[] = [
   { id: "gemini", label: "Gemini", defaultCommand: "gemini" },
   { id: "custom", label: "Custom", defaultCommand: "" },
 ];
-const AGENT_LABELS = AGENT_OPTIONS.map((option) => option.label.toLowerCase());
 
-const isAgentPaneName = (name: string) => {
-  const normalized = name.trim().toLowerCase();
-  if (!normalized) return false;
-  return AGENT_LABELS.some((label) => normalized.includes(label));
+const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
+  activityMotion: "fast",
+  closeButtonMode: "hover",
 };
+
+const DEFAULT_WORKSPACE_PREFERENCES: WorkspacePreferences = {
+  defaultWorkspaceName: "Workspace",
+  defaultGridLayoutId: DEFAULT_GRID_LAYOUT_ID,
+};
+
+const DEFAULT_UPDATER_SETTINGS: UpdaterSettings = {
+  githubToken: "",
+};
+
+const SETTINGS_SECTIONS: Array<{
+  id: SettingsSection;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: "appearance",
+    label: "Appearance",
+    description: "Visual behavior, activity lines, and chrome style.",
+  },
+  {
+    id: "controls",
+    label: "Controls",
+    description: "Keyboard shortcuts and interaction bindings.",
+  },
+  {
+    id: "workspace",
+    label: "Workspace",
+    description: "Default workspace values for quick launch.",
+  },
+  {
+    id: "updates",
+    label: "Updates",
+    description: "Version status and release installation.",
+  },
+];
 
 const getGridLayout = (id: string) =>
   GRID_LAYOUT_OPTIONS.find((option) => option.id === id) ?? GRID_LAYOUT_OPTIONS[0];
@@ -255,6 +307,85 @@ const saveShortcuts = (shortcuts: ShortcutSettings) => {
   window.localStorage.setItem("greepy.shortcuts", JSON.stringify(shortcuts));
 };
 
+const loadAppearanceSettings = (): AppearanceSettings => {
+  if (typeof window === "undefined") return DEFAULT_APPEARANCE_SETTINGS;
+  const raw = window.localStorage.getItem(APPEARANCE_SETTINGS_KEY);
+  if (!raw) return DEFAULT_APPEARANCE_SETTINGS;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
+    const activityMotion =
+      parsed.activityMotion === "slow" ||
+      parsed.activityMotion === "balanced" ||
+      parsed.activityMotion === "fast"
+        ? parsed.activityMotion
+        : DEFAULT_APPEARANCE_SETTINGS.activityMotion;
+    const closeButtonMode =
+      parsed.closeButtonMode === "always" || parsed.closeButtonMode === "hover"
+        ? parsed.closeButtonMode
+        : DEFAULT_APPEARANCE_SETTINGS.closeButtonMode;
+    return { activityMotion, closeButtonMode };
+  } catch {
+    return DEFAULT_APPEARANCE_SETTINGS;
+  }
+};
+
+const saveAppearanceSettings = (settings: AppearanceSettings) => {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(APPEARANCE_SETTINGS_KEY, JSON.stringify(settings));
+};
+
+const loadWorkspacePreferences = (): WorkspacePreferences => {
+  if (typeof window === "undefined") return DEFAULT_WORKSPACE_PREFERENCES;
+  const raw = window.localStorage.getItem(WORKSPACE_PREFERENCES_KEY);
+  if (!raw) return DEFAULT_WORKSPACE_PREFERENCES;
+  try {
+    const parsed = JSON.parse(raw) as Partial<WorkspacePreferences>;
+    const hasValidGridLayout =
+      typeof parsed.defaultGridLayoutId === "string" &&
+      GRID_LAYOUT_OPTIONS.some((option) => option.id === parsed.defaultGridLayoutId);
+    return {
+      defaultWorkspaceName:
+        typeof parsed.defaultWorkspaceName === "string" &&
+        parsed.defaultWorkspaceName.trim()
+          ? parsed.defaultWorkspaceName
+          : DEFAULT_WORKSPACE_PREFERENCES.defaultWorkspaceName,
+      defaultGridLayoutId: hasValidGridLayout
+        ? parsed.defaultGridLayoutId!
+        : DEFAULT_WORKSPACE_PREFERENCES.defaultGridLayoutId,
+    };
+  } catch {
+    return DEFAULT_WORKSPACE_PREFERENCES;
+  }
+};
+
+const saveWorkspacePreferences = (preferences: WorkspacePreferences) => {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(
+    WORKSPACE_PREFERENCES_KEY,
+    JSON.stringify(preferences),
+  );
+};
+
+const loadUpdaterSettings = (): UpdaterSettings => {
+  if (typeof window === "undefined") return DEFAULT_UPDATER_SETTINGS;
+  const raw = window.localStorage.getItem(UPDATER_SETTINGS_KEY);
+  if (!raw) return DEFAULT_UPDATER_SETTINGS;
+  try {
+    const parsed = JSON.parse(raw) as Partial<UpdaterSettings>;
+    return {
+      githubToken:
+        typeof parsed.githubToken === "string" ? parsed.githubToken : "",
+    };
+  } catch {
+    return DEFAULT_UPDATER_SETTINGS;
+  }
+};
+
+const saveUpdaterSettings = (settings: UpdaterSettings) => {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(UPDATER_SETTINGS_KEY, JSON.stringify(settings));
+};
+
 let ptyCreateQueue: Promise<void> = Promise.resolve();
 const startupCommandExecuted = new Set<string>();
 
@@ -273,6 +404,34 @@ const createRuntimeId = (prefix: string) =>
     ? `${prefix}-${crypto.randomUUID()}`
     : `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 
+const ACTIVITY_VARIANT_COUNT = 25;
+
+type ActivityPalette = {
+  primaryGradient: string;
+  secondaryGradient: string;
+  primaryGlowSoft: string;
+  primaryGlowStrong: string;
+  secondaryGlowSoft: string;
+  secondaryGlowStrong: string;
+};
+
+const createActivityPalette = (variant: number): ActivityPalette => {
+  const hueA = (variant * 29 + 16) % 360;
+  const hueB = (hueA + 32 + (variant % 4) * 8) % 360;
+  const hueC = (hueA + 78 + (variant % 5) * 6) % 360;
+  const hueD = (hueA + 138 + (variant % 3) * 9) % 360;
+  const hueE = (hueA + 202 + (variant % 7) * 4) % 360;
+
+  return {
+    primaryGradient: `linear-gradient(90deg, transparent 0%, hsla(${hueA}, 92%, 58%, 0.08) 6%, hsla(${hueB}, 96%, 63%, 0.56) 24%, hsla(${hueC}, 100%, 70%, 0.98) 43%, hsla(${hueD}, 98%, 67%, 1) 57%, hsla(${hueB}, 92%, 60%, 0.62) 78%, hsla(${hueE}, 86%, 56%, 0.12) 94%, transparent 100%)`,
+    secondaryGradient: `linear-gradient(90deg, transparent 0%, hsla(${hueE}, 86%, 56%, 0.06) 4%, hsla(${hueC}, 98%, 66%, 0.36) 26%, hsla(${hueD}, 92%, 63%, 0.9) 50%, hsla(${hueB}, 98%, 68%, 0.36) 74%, hsla(${hueA}, 86%, 58%, 0.08) 96%, transparent 100%)`,
+    primaryGlowSoft: `hsla(${hueC}, 100%, 72%, 0.72)`,
+    primaryGlowStrong: `hsla(${hueD}, 94%, 62%, 0.46)`,
+    secondaryGlowSoft: `hsla(${hueB}, 100%, 72%, 0.56)`,
+    secondaryGlowStrong: `hsla(${hueA}, 90%, 60%, 0.34)`,
+  };
+};
+
 const createPane = (index: number): Pane => ({
   id: createRuntimeId("pane"),
   name: `Terminal ${index}`,
@@ -280,7 +439,7 @@ const createPane = (index: number): Pane => ({
 
 type TerminalPaneProps = {
   id: string;
-  isAgentPane: boolean;
+  activityVariant: number;
   layoutTick: number;
   isActive: boolean;
   onSelect: (id: string) => void;
@@ -293,7 +452,7 @@ type TerminalPaneProps = {
 
 function TerminalPane({
   id,
-  isAgentPane,
+  activityVariant,
   layoutTick,
   isActive,
   onSelect,
@@ -315,6 +474,19 @@ function TerminalPane({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isAgentWorking, setIsAgentWorking] = useState(false);
+  const activityPalette = useMemo(() => createActivityPalette(activityVariant), [activityVariant]);
+  const activityVariantStyle = useMemo(
+    () =>
+      ({
+        "--activity-primary-gradient": activityPalette.primaryGradient,
+        "--activity-secondary-gradient": activityPalette.secondaryGradient,
+        "--activity-primary-glow-soft": activityPalette.primaryGlowSoft,
+        "--activity-primary-glow-strong": activityPalette.primaryGlowStrong,
+        "--activity-secondary-glow-soft": activityPalette.secondaryGlowSoft,
+        "--activity-secondary-glow-strong": activityPalette.secondaryGlowStrong,
+      }) as Record<string, string>,
+    [activityPalette],
+  );
 
   const handleTileClick = () => {
     onSelect(id);
@@ -328,7 +500,6 @@ function TerminalPane({
   };
 
   const hasInterruptSignal = () => {
-    if (!isAgentPane) return false;
     const term = termRef.current;
     if (!term) return false;
 
@@ -349,10 +520,6 @@ function TerminalPane({
   };
 
   const syncWorkingFromTerminal = () => {
-    if (!isAgentPane) {
-      setWorkingState(false);
-      return;
-    }
     const now = Date.now();
     const hasInterruptMarker = hasInterruptSignal();
     const hasRecentBusySignal = now - lastBusySignalAtRef.current < AGENT_BUSY_GRACE_MS;
@@ -467,8 +634,6 @@ function TerminalPane({
 
       term.onData((data) => {
         void invoke("pty_write", { id, data });
-        if (!isAgentPane) return;
-
         const now = Date.now();
         if (data.includes("\u0003")) {
           awaitingResponseRef.current = false;
@@ -504,14 +669,12 @@ function TerminalPane({
         if (event.payload.id === id) {
           setIsLoading(false);
           term.write(event.payload.data);
-          if (isAgentPane) {
-            const now = Date.now();
-            lastOutputAtRef.current = now;
-            if (hasBusySignalInChunk(event.payload.data)) {
-              lastBusySignalAtRef.current = now;
-            }
-            scheduleDelayedSignalSync();
+          const now = Date.now();
+          lastOutputAtRef.current = now;
+          if (hasBusySignalInChunk(event.payload.data)) {
+            lastBusySignalAtRef.current = now;
           }
+          scheduleDelayedSignalSync();
           scheduleSignalSync();
         }
       });
@@ -569,7 +732,7 @@ function TerminalPane({
       setWorkingState(false);
       void invoke("pty_close", { id });
     };
-  }, [id, cwd, isAgentPane]);
+  }, [id, cwd]);
 
   useEffect(() => {
     if (isActive) {
@@ -597,24 +760,24 @@ function TerminalPane({
   return (
     <div className={`tile ${isActive ? "active" : ""}`} onClick={handleTileClick}>
       <div className="tile-status-bar">
-        {isAgentPane && (
-          <div className={`tile-activity ${isAgentWorking ? "working" : ""}`}>
-            <span className="activity-wave" />
-            <span className="activity-wave secondary" />
-          </div>
-        )}
-      </div>
-      <div className="tile-actions">
+        <div className={`tile-activity ${isAgentWorking ? "working" : ""}`} style={activityVariantStyle as any}>
+          <span className="activity-wave" />
+          <span className="activity-wave secondary" />
+        </div>
         <button
-          className="btn"
+          className="tile-close-btn"
           onClick={(event) => {
             event.stopPropagation();
             onClose(id);
           }}
           disabled={!canClose}
           title={canClose ? "Close terminal" : "At least one terminal required"}
+          aria-label="Close terminal"
         >
-          ×
+          <svg className="tile-close-icon" viewBox="0 0 12 12" aria-hidden="true">
+            <path d="M2 2 L10 10" />
+            <path d="M10 2 L2 10" />
+          </svg>
         </button>
       </div>
       {isLoading && !error && (
@@ -901,7 +1064,12 @@ function MainApp() {
   const [layoutTick, setLayoutTick] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [projectPath, setProjectPath] = useState("");
-  const [workspaceName, setWorkspaceName] = useState("Workspace");
+  const [workspacePreferences, setWorkspacePreferences] = useState<WorkspacePreferences>(
+    () => loadWorkspacePreferences(),
+  );
+  const [workspaceName, setWorkspaceName] = useState(
+    workspacePreferences.defaultWorkspaceName,
+  );
   const [fixedGridLayoutId, setFixedGridLayoutId] = useState<string | null>(null);
   const [startupCommands, setStartupCommands] = useState<Record<string, string>>({});
   const [isProjectReady, setIsProjectReady] = useState(false);
@@ -910,9 +1078,9 @@ function MainApp() {
     useState<WorkspaceSetupMode>("active-tab");
   const [workspaceSetupError, setWorkspaceSetupError] = useState<string | null>(null);
   const [workspaceSetupForm, setWorkspaceSetupForm] = useState<WorkspaceSetupForm>({
-    workspaceName: "Workspace",
+    workspaceName: workspacePreferences.defaultWorkspaceName,
     projectPath: loadLastProject(),
-    gridLayoutId: DEFAULT_GRID_LAYOUT_ID,
+    gridLayoutId: workspacePreferences.defaultGridLayoutId,
     allocations: createDefaultAllocations(),
   });
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(() =>
@@ -927,6 +1095,20 @@ function MainApp() {
   const [availableUpdateVersion, setAvailableUpdateVersion] = useState<string | null>(
     null,
   );
+  const [appearanceSettings, setAppearanceSettings] = useState<AppearanceSettings>(
+    () => loadAppearanceSettings(),
+  );
+  const [draftAppearanceSettings, setDraftAppearanceSettings] =
+    useState<AppearanceSettings>(appearanceSettings);
+  const [draftWorkspacePreferences, setDraftWorkspacePreferences] =
+    useState<WorkspacePreferences>(workspacePreferences);
+  const [activeSettingsSection, setActiveSettingsSection] =
+    useState<SettingsSection>("controls");
+  const [updaterSettings, setUpdaterSettings] = useState<UpdaterSettings>(() =>
+    loadUpdaterSettings(),
+  );
+  const [draftUpdaterSettings, setDraftUpdaterSettings] =
+    useState<UpdaterSettings>(updaterSettings);
   const [shortcuts, setShortcuts] = useState<ShortcutSettings>(() =>
     loadShortcuts(),
   );
@@ -1167,8 +1349,17 @@ function MainApp() {
   useEffect(() => {
     if (!isSettingsOpen) return;
     setDraftShortcuts(shortcuts);
+    setDraftAppearanceSettings(appearanceSettings);
+    setDraftWorkspacePreferences(workspacePreferences);
+    setDraftUpdaterSettings(updaterSettings);
     setShortcutError(null);
-  }, [isSettingsOpen, shortcuts]);
+  }, [
+    isSettingsOpen,
+    shortcuts,
+    appearanceSettings,
+    workspacePreferences,
+    updaterSettings,
+  ]);
 
   const selectedWorkspaceGrid = useMemo(
     () => getGridLayout(workspaceSetupForm.gridLayoutId),
@@ -1248,7 +1439,10 @@ function MainApp() {
         ? loadLastProject()
         : projectPath || workspaceSetupForm.projectPath || loadLastProject();
     const fallbackWorkspace =
-      seedName || getFolderName(currentPath) || workspaceName || "Workspace";
+      seedName ||
+      getFolderName(currentPath) ||
+      workspaceName ||
+      workspacePreferences.defaultWorkspaceName;
     setWorkspaceSetupForm((current) => ({
       ...current,
       projectPath: currentPath,
@@ -1259,8 +1453,10 @@ function MainApp() {
         : fallbackWorkspace,
       gridLayoutId:
         mode === "new-tab"
-          ? DEFAULT_GRID_LAYOUT_ID
-          : fixedGridLayoutId ?? current.gridLayoutId,
+          ? workspacePreferences.defaultGridLayoutId
+          : fixedGridLayoutId ??
+            current.gridLayoutId ??
+            workspacePreferences.defaultGridLayoutId,
       allocations:
         mode === "new-tab" ? createDefaultAllocations() : current.allocations,
     }));
@@ -1637,6 +1833,16 @@ function MainApp() {
     await invoke("pty_write", { id: activeId, data: `${command}\r` });
   };
 
+  const openSettings = (section: SettingsSection = "controls") => {
+    setActiveSettingsSection(section);
+    setIsSettingsOpen(true);
+  };
+
+  const closeSettings = () => {
+    setIsSettingsOpen(false);
+    setShortcutError(null);
+  };
+
   const handleShortcutChange = (
     field: keyof ShortcutSettings,
     value: string,
@@ -1670,7 +1876,38 @@ function MainApp() {
     const next = { splitHorizontalKey, splitVerticalKey };
     setShortcuts(next);
     saveShortcuts(next);
-    setIsSettingsOpen(false);
+    closeSettings();
+  };
+
+  const handleSaveAppearance = () => {
+    setAppearanceSettings(draftAppearanceSettings);
+    saveAppearanceSettings(draftAppearanceSettings);
+    closeSettings();
+  };
+
+  const handleSaveWorkspacePreferences = () => {
+    const next: WorkspacePreferences = {
+      defaultWorkspaceName:
+        draftWorkspacePreferences.defaultWorkspaceName.trim() ||
+        DEFAULT_WORKSPACE_PREFERENCES.defaultWorkspaceName,
+      defaultGridLayoutId: GRID_LAYOUT_OPTIONS.some(
+        (option) => option.id === draftWorkspacePreferences.defaultGridLayoutId,
+      )
+        ? draftWorkspacePreferences.defaultGridLayoutId
+        : DEFAULT_WORKSPACE_PREFERENCES.defaultGridLayoutId,
+    };
+    setWorkspacePreferences(next);
+    saveWorkspacePreferences(next);
+    closeSettings();
+  };
+
+  const handleSaveUpdaterSettings = () => {
+    const next = {
+      githubToken: draftUpdaterSettings.githubToken.trim(),
+    };
+    setUpdaterSettings(next);
+    saveUpdaterSettings(next);
+    closeSettings();
   };
 
   const handleOpenServersWindow = async () => {
@@ -1719,7 +1956,16 @@ function MainApp() {
     setIsCheckingForUpdates(true);
     let update: Awaited<ReturnType<typeof check>> = null;
     try {
-      update = await check();
+      const githubToken = updaterSettings.githubToken.trim();
+      const checkOptions = githubToken
+        ? {
+            headers: {
+              Authorization: `Bearer ${githubToken}`,
+              Accept: "application/octet-stream",
+            },
+          }
+        : undefined;
+      update = await check(checkOptions);
       if (!update) {
         setAvailableUpdateVersion(null);
         if (!silent) {
@@ -1761,8 +2007,15 @@ function MainApp() {
         await relaunch();
       }
     } catch (error) {
+      const rawMessage = formatErrorMessage(error);
+      const normalizedError = rawMessage.toLowerCase();
+      const privateRepoHint =
+        normalizedError.includes("valid release json") ||
+        normalizedError.includes("not found")
+          ? "\n\nUpdater endpoint returned 404/invalid JSON. If the GitHub repo is private, add a read-only GitHub token in Settings > Updates, or make releases public."
+          : "";
       if (!silent) {
-        await message(`Unable to check for updates.\n\n${formatErrorMessage(error)}`, {
+        await message(`Unable to check for updates.\n\n${rawMessage}${privateRepoHint}`, {
           title: "Update Error",
           kind: "error",
         });
@@ -1857,7 +2110,7 @@ function MainApp() {
           id: "open-settings",
           label: "Open settings",
           run: () => {
-            setIsSettingsOpen(true);
+            openSettings("controls");
             setIsPaletteOpen(false);
           },
         },
@@ -2199,8 +2452,29 @@ function MainApp() {
     setIsMenuOpen(false);
   };
 
+  const activeSettingsMeta =
+    SETTINGS_SECTIONS.find((section) => section.id === activeSettingsSection) ??
+    SETTINGS_SECTIONS[0];
+  const activityMotionClass =
+    appearanceSettings.activityMotion === "slow"
+      ? "activity-slow"
+      : appearanceSettings.activityMotion === "balanced"
+        ? "activity-balanced"
+        : "activity-fast";
+  const closeModeClass =
+    appearanceSettings.closeButtonMode === "always" ? "close-dot-always" : "";
+
+  let activityVariantCursor = 0;
+  const getNextActivityVariant = () => {
+    const next = (activityVariantCursor % ACTIVITY_VARIANT_COUNT) + 1;
+    activityVariantCursor += 1;
+    return next;
+  };
+
   return (
-    <div className={`app ${isFullscreen ? "fullscreen" : ""}`}>
+    <div
+      className={`app ${isFullscreen ? "fullscreen" : ""} ${activityMotionClass} ${closeModeClass}`}
+    >
       <header className="topbar">
         <div className="topbar-tabs">
           {tabs.map((tab) => (
@@ -2267,7 +2541,7 @@ function MainApp() {
               </button>
               <button
                 className="topbar-dropdown-item"
-                onClick={() => handleMenuAction(() => setIsSettingsOpen(true))}
+                onClick={() => handleMenuAction(() => openSettings("controls"))}
               >
                 Settings
               </button>
@@ -2335,7 +2609,7 @@ function MainApp() {
                 <TerminalPane
                   key={pane.id}
                   id={pane.id}
-                  isAgentPane={isAgentPaneName(pane.name)}
+                  activityVariant={getNextActivityVariant()}
                   layoutTick={layoutTick}
                   isActive={isTabActive && pane.id === activeId}
                   onSelect={isTabActive ? (id) => setActiveId(id) : () => undefined}
@@ -2356,68 +2630,238 @@ function MainApp() {
       {workspaceSetupModal}
 
       {isSettingsOpen && (
-        <div className="modal-backdrop" onClick={() => setIsSettingsOpen(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-backdrop" onClick={closeSettings}>
+          <div className="modal settings-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <div>
                 <div className="modal-title">Settings</div>
-                <div className="modal-subtitle">
-                  Choose your split shortcuts (Ctrl + letter).
-                </div>
+                <div className="modal-subtitle">{activeSettingsMeta.description}</div>
               </div>
               <button
                 className="btn"
-                onClick={() => setIsSettingsOpen(false)}
+                onClick={closeSettings}
                 aria-label="Close settings"
               >
                 ×
               </button>
             </div>
-            <div className="modal-body">
-              <label className="field">
-                <span>Split horizontal</span>
-                <div className="field-input">
-                  <span className="field-prefix">Ctrl +</span>
-                  <input
-                    value={draftShortcuts.splitHorizontalKey.toUpperCase()}
-                    onChange={(event) =>
-                      handleShortcutChange(
-                        "splitHorizontalKey",
-                        event.target.value,
-                      )
-                    }
-                    maxLength={1}
-                  />
-                </div>
-              </label>
-              <label className="field">
-                <span>Split vertical</span>
-                <div className="field-input">
-                  <span className="field-prefix">Ctrl +</span>
-                  <input
-                    value={draftShortcuts.splitVerticalKey.toUpperCase()}
-                    onChange={(event) =>
-                      handleShortcutChange(
-                        "splitVerticalKey",
-                        event.target.value,
-                      )
-                    }
-                    maxLength={1}
-                  />
-                </div>
-              </label>
-              {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
-              draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (
-                <div className="field-hint">
-                  Using Ctrl+V will override paste in terminals.
-                </div>
-              ) : null}
-              {shortcutError && <div className="field-error">{shortcutError}</div>}
+            <div className="modal-body settings-layout">
+              <aside className="settings-sidebar">
+                {SETTINGS_SECTIONS.map((section) => (
+                  <button
+                    key={section.id}
+                    className={`settings-nav-item ${
+                      activeSettingsSection === section.id ? "active" : ""
+                    }`}
+                    onClick={() => setActiveSettingsSection(section.id)}
+                  >
+                    <span className="settings-nav-label">{section.label}</span>
+                    <span className="settings-nav-description">{section.description}</span>
+                  </button>
+                ))}
+              </aside>
+              <section className="settings-panel">
+                {activeSettingsSection === "appearance" && (
+                  <div className="settings-section">
+                    <div className="settings-section-title">Appearance</div>
+                    <div className="settings-section-subtitle">
+                      Tune activity visuals and chrome behavior.
+                    </div>
+                    <label className="field settings-field">
+                      <span>Activity line speed</span>
+                      <select
+                        value={draftAppearanceSettings.activityMotion}
+                        onChange={(event) =>
+                          setDraftAppearanceSettings((current) => ({
+                            ...current,
+                            activityMotion: event.target.value as AppearanceSettings["activityMotion"],
+                          }))
+                        }
+                      >
+                        <option value="fast">Fast</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="slow">Slow</option>
+                      </select>
+                    </label>
+                    <label className="field settings-field">
+                      <span>Close button visibility</span>
+                      <select
+                        value={draftAppearanceSettings.closeButtonMode}
+                        onChange={(event) =>
+                          setDraftAppearanceSettings((current) => ({
+                            ...current,
+                            closeButtonMode:
+                              event.target.value as AppearanceSettings["closeButtonMode"],
+                          }))
+                        }
+                      >
+                        <option value="hover">Show on hover</option>
+                        <option value="always">Always visible</option>
+                      </select>
+                    </label>
+                    <div className="settings-card">
+                      <div className="settings-card-title">Terminal activity variants</div>
+                      <div className="settings-card-text">
+                        25 animated color combos are automatically distributed across open terminals.
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {activeSettingsSection === "controls" && (
+                  <div className="settings-section">
+                    <div className="settings-section-title">Controls</div>
+                    <div className="settings-section-subtitle">
+                      Configure split shortcuts used inside the terminal grid.
+                    </div>
+                    <label className="field settings-field">
+                      <span>Split horizontal</span>
+                      <div className="field-input">
+                        <span className="field-prefix">Ctrl +</span>
+                        <input
+                          value={draftShortcuts.splitHorizontalKey.toUpperCase()}
+                          onChange={(event) =>
+                            handleShortcutChange(
+                              "splitHorizontalKey",
+                              event.target.value,
+                            )
+                          }
+                          maxLength={1}
+                        />
+                      </div>
+                    </label>
+                    <label className="field settings-field">
+                      <span>Split vertical</span>
+                      <div className="field-input">
+                        <span className="field-prefix">Ctrl +</span>
+                        <input
+                          value={draftShortcuts.splitVerticalKey.toUpperCase()}
+                          onChange={(event) =>
+                            handleShortcutChange(
+                              "splitVerticalKey",
+                              event.target.value,
+                            )
+                          }
+                          maxLength={1}
+                        />
+                      </div>
+                    </label>
+                    {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
+                    draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (
+                      <div className="field-hint">
+                        Using Ctrl+V will override paste in terminals.
+                      </div>
+                    ) : null}
+                    {shortcutError && <div className="field-error">{shortcutError}</div>}
+                  </div>
+                )}
+
+                {activeSettingsSection === "workspace" && (
+                  <div className="settings-section">
+                    <div className="settings-section-title">Workspace Defaults</div>
+                    <div className="settings-section-subtitle">
+                      Applied when opening a new workspace setup flow.
+                    </div>
+                    <label className="field settings-field">
+                      <span>Default workspace name</span>
+                      <input
+                        value={draftWorkspacePreferences.defaultWorkspaceName}
+                        onChange={(event) =>
+                          setDraftWorkspacePreferences((current) => ({
+                            ...current,
+                            defaultWorkspaceName: event.target.value,
+                          }))
+                        }
+                        placeholder="Workspace"
+                      />
+                    </label>
+                    <label className="field settings-field">
+                      <span>Default grid layout</span>
+                      <select
+                        value={draftWorkspacePreferences.defaultGridLayoutId}
+                        onChange={(event) =>
+                          setDraftWorkspacePreferences((current) => ({
+                            ...current,
+                            defaultGridLayoutId: event.target.value,
+                          }))
+                        }
+                      >
+                        {GRID_LAYOUT_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label} ({getGridCapacity(option)} panes)
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                )}
+
+                {activeSettingsSection === "updates" && (
+                  <div className="settings-section">
+                    <div className="settings-section-title">Updates</div>
+                    <div className="settings-section-subtitle">
+                      Check GitHub Release updates and install inside the app.
+                    </div>
+                    <label className="field settings-field">
+                      <span>GitHub token (optional)</span>
+                      <input
+                        type="password"
+                        value={draftUpdaterSettings.githubToken}
+                        onChange={(event) =>
+                          setDraftUpdaterSettings((current) => ({
+                            ...current,
+                            githubToken: event.target.value,
+                          }))
+                        }
+                        placeholder="ghp_xxx (required for private repo updates)"
+                      />
+                    </label>
+                    <div className="workspace-helper">
+                      If your releases are private, add a token with read-only repository access.
+                    </div>
+                    <div className="settings-card">
+                      <div className="settings-card-title">Current status</div>
+                      <div className="settings-card-text">
+                        {availableUpdateVersion
+                          ? `Update available: v${availableUpdateVersion}`
+                          : "No pending update detected in this session."}
+                      </div>
+                    </div>
+                    <button
+                      className="btn secondary settings-inline-action"
+                      onClick={() => void handleCheckForUpdates()}
+                      disabled={isCheckingForUpdates}
+                    >
+                      {isCheckingForUpdates ? "Checking..." : "Check for Updates"}
+                    </button>
+                  </div>
+                )}
+              </section>
             </div>
             <div className="modal-actions">
-              <button className="btn primary" onClick={handleSaveShortcuts}>
-                Save
+              <button className="btn secondary" onClick={closeSettings}>
+                Cancel
               </button>
+              {activeSettingsSection === "controls" && (
+                <button className="btn primary" onClick={handleSaveShortcuts}>
+                  Save Controls
+                </button>
+              )}
+              {activeSettingsSection === "appearance" && (
+                <button className="btn primary" onClick={handleSaveAppearance}>
+                  Save Appearance
+                </button>
+              )}
+              {activeSettingsSection === "workspace" && (
+                <button className="btn primary" onClick={handleSaveWorkspacePreferences}>
+                  Save Workspace
+                </button>
+              )}
+              {activeSettingsSection === "updates" && (
+                <button className="btn primary" onClick={handleSaveUpdaterSettings}>
+                  Save Updates
+                </button>
+              )}
             </div>
           </div>
         </div>
