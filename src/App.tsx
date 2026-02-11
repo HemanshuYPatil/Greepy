@@ -81,8 +81,17 @@ type WorkspaceSetupForm = {
 
 type WorkspaceSetupMode = "active-tab" | "new-tab";
 type SettingsSection = "appearance" | "controls" | "workspace" | "updates";
+type AppTheme =
+  | "obsidian"
+  | "neon-noir"
+  | "ember-graphite"
+  | "ocean-steel"
+  | "forest-night";
+type AppLayout = "clean" | "compact" | "spacious";
 
 type AppearanceSettings = {
+  appTheme: AppTheme;
+  appLayout: AppLayout;
   activityMotion: "fast" | "balanced" | "slow";
   closeButtonMode: "hover" | "always";
 };
@@ -131,6 +140,8 @@ const AGENT_OPTIONS: AgentOption[] = [
 ];
 
 const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
+  appTheme: "obsidian",
+  appLayout: "clean",
   activityMotion: "fast",
   closeButtonMode: "hover",
 };
@@ -313,6 +324,20 @@ const loadAppearanceSettings = (): AppearanceSettings => {
   if (!raw) return DEFAULT_APPEARANCE_SETTINGS;
   try {
     const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
+    const appTheme =
+      parsed.appTheme === "obsidian" ||
+      parsed.appTheme === "neon-noir" ||
+      parsed.appTheme === "ember-graphite" ||
+      parsed.appTheme === "ocean-steel" ||
+      parsed.appTheme === "forest-night"
+        ? parsed.appTheme
+        : DEFAULT_APPEARANCE_SETTINGS.appTheme;
+    const appLayout =
+      parsed.appLayout === "compact" ||
+      parsed.appLayout === "spacious" ||
+      parsed.appLayout === "clean"
+        ? parsed.appLayout
+        : DEFAULT_APPEARANCE_SETTINGS.appLayout;
     const activityMotion =
       parsed.activityMotion === "slow" ||
       parsed.activityMotion === "balanced" ||
@@ -323,7 +348,7 @@ const loadAppearanceSettings = (): AppearanceSettings => {
       parsed.closeButtonMode === "always" || parsed.closeButtonMode === "hover"
         ? parsed.closeButtonMode
         : DEFAULT_APPEARANCE_SETTINGS.closeButtonMode;
-    return { activityMotion, closeButtonMode };
+    return { appTheme, appLayout, activityMotion, closeButtonMode };
   } catch {
     return DEFAULT_APPEARANCE_SETTINGS;
   }
@@ -379,11 +404,6 @@ const loadUpdaterSettings = (): UpdaterSettings => {
   } catch {
     return DEFAULT_UPDATER_SETTINGS;
   }
-};
-
-const saveUpdaterSettings = (settings: UpdaterSettings) => {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(UPDATER_SETTINGS_KEY, JSON.stringify(settings));
 };
 
 let ptyCreateQueue: Promise<void> = Promise.resolve();
@@ -1104,11 +1124,7 @@ function MainApp() {
     useState<WorkspacePreferences>(workspacePreferences);
   const [activeSettingsSection, setActiveSettingsSection] =
     useState<SettingsSection>("controls");
-  const [updaterSettings, setUpdaterSettings] = useState<UpdaterSettings>(() =>
-    loadUpdaterSettings(),
-  );
-  const [draftUpdaterSettings, setDraftUpdaterSettings] =
-    useState<UpdaterSettings>(updaterSettings);
+  const [updaterSettings] = useState<UpdaterSettings>(() => loadUpdaterSettings());
   const [shortcuts, setShortcuts] = useState<ShortcutSettings>(() =>
     loadShortcuts(),
   );
@@ -1351,14 +1367,12 @@ function MainApp() {
     setDraftShortcuts(shortcuts);
     setDraftAppearanceSettings(appearanceSettings);
     setDraftWorkspacePreferences(workspacePreferences);
-    setDraftUpdaterSettings(updaterSettings);
     setShortcutError(null);
   }, [
     isSettingsOpen,
     shortcuts,
     appearanceSettings,
     workspacePreferences,
-    updaterSettings,
   ]);
 
   const selectedWorkspaceGrid = useMemo(
@@ -1901,15 +1915,6 @@ function MainApp() {
     closeSettings();
   };
 
-  const handleSaveUpdaterSettings = () => {
-    const next = {
-      githubToken: draftUpdaterSettings.githubToken.trim(),
-    };
-    setUpdaterSettings(next);
-    saveUpdaterSettings(next);
-    closeSettings();
-  };
-
   const handleOpenServersWindow = async () => {
     setIsServersInline(true);
     const existing = await WebviewWindow.getByLabel("servers");
@@ -2347,9 +2352,22 @@ function MainApp() {
     </div>
   ) : null;
 
+  const appThemeClass = `theme-${appearanceSettings.appTheme}`;
+  const appLayoutClass = `layout-${appearanceSettings.appLayout}`;
+  const activityMotionClass =
+    appearanceSettings.activityMotion === "slow"
+      ? "activity-slow"
+      : appearanceSettings.activityMotion === "balanced"
+        ? "activity-balanced"
+        : "activity-fast";
+  const closeModeClass =
+    appearanceSettings.closeButtonMode === "always" ? "close-dot-always" : "";
+
   if (!isProjectReady) {
     return (
-      <div className="app">
+      <div
+        className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
+      >
         <div className="project-screen">
           <div className="project-shell">
             <div className="project-header">
@@ -2364,6 +2382,26 @@ function MainApp() {
               </button>
               {projectPath && <div className="project-path">{projectPath}</div>}
             </div>
+            {availableUpdateVersion && (
+              <div className="startup-update-card">
+                <div className="startup-update-copy">
+                  <div className="startup-update-label">Update Available</div>
+                  <div className="startup-update-title">
+                    Version v{availableUpdateVersion} is ready to install.
+                  </div>
+                  <div className="startup-update-meta">
+                    Includes latest fixes and features from your newest release.
+                  </div>
+                </div>
+                <button
+                  className="btn primary startup-update-action"
+                  onClick={() => void handleCheckForUpdates()}
+                  disabled={isCheckingForUpdates}
+                >
+                  {isCheckingForUpdates ? "Checking..." : "Install Update"}
+                </button>
+              </div>
+            )}
             {loadSession() && (
               <button
                 className="btn secondary"
@@ -2455,14 +2493,6 @@ function MainApp() {
   const activeSettingsMeta =
     SETTINGS_SECTIONS.find((section) => section.id === activeSettingsSection) ??
     SETTINGS_SECTIONS[0];
-  const activityMotionClass =
-    appearanceSettings.activityMotion === "slow"
-      ? "activity-slow"
-      : appearanceSettings.activityMotion === "balanced"
-        ? "activity-balanced"
-        : "activity-fast";
-  const closeModeClass =
-    appearanceSettings.closeButtonMode === "always" ? "close-dot-always" : "";
 
   let activityVariantCursor = 0;
   const getNextActivityVariant = () => {
@@ -2473,7 +2503,7 @@ function MainApp() {
 
   return (
     <div
-      className={`app ${isFullscreen ? "fullscreen" : ""} ${activityMotionClass} ${closeModeClass}`}
+      className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
     >
       <header className="topbar">
         <div className="topbar-tabs">
@@ -2665,7 +2695,47 @@ function MainApp() {
                   <div className="settings-section">
                     <div className="settings-section-title">Appearance</div>
                     <div className="settings-section-subtitle">
-                      Tune activity visuals and chrome behavior.
+                      Configure the full app theme and layout style.
+                    </div>
+                    <label className="field settings-field">
+                      <span>App Theme</span>
+                      <select
+                        value={draftAppearanceSettings.appTheme}
+                        onChange={(event) =>
+                          setDraftAppearanceSettings((current) => ({
+                            ...current,
+                            appTheme: event.target.value as AppTheme,
+                          }))
+                        }
+                      >
+                        <option value="obsidian">Obsidian Flux</option>
+                        <option value="neon-noir">Neon Noir</option>
+                        <option value="ember-graphite">Ember Graphite</option>
+                        <option value="ocean-steel">Ocean Steel</option>
+                        <option value="forest-night">Forest Night</option>
+                      </select>
+                    </label>
+                    <label className="field settings-field">
+                      <span>Layout Style</span>
+                      <select
+                        value={draftAppearanceSettings.appLayout}
+                        onChange={(event) =>
+                          setDraftAppearanceSettings((current) => ({
+                            ...current,
+                            appLayout: event.target.value as AppLayout,
+                          }))
+                        }
+                      >
+                        <option value="clean">Clean</option>
+                        <option value="compact">Compact</option>
+                        <option value="spacious">Spacious</option>
+                      </select>
+                    </label>
+                    <div className="settings-card">
+                      <div className="settings-card-title">Theme Direction</div>
+                      <div className="settings-card-text">
+                        All themes are dark-first and optimized for long terminal sessions.
+                      </div>
                     </div>
                     <label className="field settings-field">
                       <span>Activity line speed</span>
@@ -2800,24 +2870,7 @@ function MainApp() {
                   <div className="settings-section">
                     <div className="settings-section-title">Updates</div>
                     <div className="settings-section-subtitle">
-                      Check GitHub Release updates and install inside the app.
-                    </div>
-                    <label className="field settings-field">
-                      <span>GitHub token (optional)</span>
-                      <input
-                        type="password"
-                        value={draftUpdaterSettings.githubToken}
-                        onChange={(event) =>
-                          setDraftUpdaterSettings((current) => ({
-                            ...current,
-                            githubToken: event.target.value,
-                          }))
-                        }
-                        placeholder="ghp_xxx (required for private repo updates)"
-                      />
-                    </label>
-                    <div className="workspace-helper">
-                      If your releases are private, add a token with read-only repository access.
+                      Check for new releases and install updates inside the app.
                     </div>
                     <div className="settings-card">
                       <div className="settings-card-title">Current status</div>
@@ -2858,8 +2911,8 @@ function MainApp() {
                 </button>
               )}
               {activeSettingsSection === "updates" && (
-                <button className="btn primary" onClick={handleSaveUpdaterSettings}>
-                  Save Updates
+                <button className="btn primary" onClick={closeSettings}>
+                  Done
                 </button>
               )}
             </div>
