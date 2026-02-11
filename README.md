@@ -55,3 +55,26 @@ The Rust backend manages pseudo-terminals and streams data to the frontend.
 
 - Window starts maximized and uses a custom (undecorated) title bar.
 - CSP is disabled in Tauri config for development.
+
+## Auto updates (GitHub Releases)
+
+The app is configured to check:
+
+- `https://github.com/HemanshuYPatil/Greepy/releases/latest/download/latest.json`
+
+When a new release is published, installed users can use **Menu -> Check for Updates** and install it in-app.
+
+### One-time GitHub setup
+
+Add these repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY`: full content of your private updater key file (`~/.tauri/greepy_updater.key`)
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: key password (empty string if no password)
+
+### Publishing a new version
+
+1. Bump `version` in `src-tauri/tauri.conf.json`.
+2. Commit and push.
+3. Create and push a version tag, e.g. `v0.1.1`.
+
+The workflow in `.github/workflows/release.yml` builds and publishes a GitHub Release with signed updater artifacts (`latest.json`, signatures, and installer files).

@@ -1,10 +1,12 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, confirm, message } from "@tauri-apps/plugin-dialog";
 import { readText as readClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
@@ -30,16 +32,18 @@ type RecentProject = {
 
 type SessionSnapshot = {
   projectPath: string;
+  workspaceName?: string;
   panes: Array<{ id: string; name: string }>;
   activeId: string;
   lastSplit: "horizontal" | "vertical";
+  gridLayoutId?: string;
   updatedAt: number;
 };
 
-type CommandEntry = {
+type WorkspaceTab = {
   id: string;
-  label: string;
-  command: string;
+  title: string;
+  snapshot: SessionSnapshot | null;
 };
 
 type ServerEntry = {
@@ -48,6 +52,34 @@ type ServerEntry = {
   command: string;
   autostart: boolean;
 };
+
+type GridLayoutOption = {
+  id: string;
+  label: string;
+  rows: number;
+  cols: number;
+};
+
+type AgentOption = {
+  id: string;
+  label: string;
+  defaultCommand: string;
+};
+
+type AgentAllocation = {
+  enabled: boolean;
+  count: number;
+  command: string;
+};
+
+type WorkspaceSetupForm = {
+  workspaceName: string;
+  projectPath: string;
+  gridLayoutId: string;
+  allocations: Record<string, AgentAllocation>;
+};
+
+type WorkspaceSetupMode = "active-tab" | "new-tab";
 
 const DEFAULT_SHORTCUTS: ShortcutSettings = {
   splitHorizontalKey: "d",
@@ -60,14 +92,44 @@ const normalizeShortcutKey = (value: string) =>
 const RECENTS_KEY = "greepy.recentProjects";
 const MAX_RECENTS = 6;
 const SESSION_KEY = "greepy.lastSession";
-const COMMANDS_KEY = "greepy.projectCommands";
 const SERVERS_KEY = "greepy.projectServers";
 const LAST_PROJECT_KEY = "greepy.lastProject";
-const DEFAULT_COMMANDS: CommandEntry[] = [
-  { id: "cmd-dev", label: "Run dev server", command: "pnpm dev" },
-  { id: "cmd-test", label: "Run tests", command: "pnpm test" },
-  { id: "cmd-status", label: "Git status", command: "git status" },
+const DEFAULT_GRID_LAYOUT_ID = "grid-2x2";
+const GRID_LAYOUT_OPTIONS: GridLayoutOption[] = [
+  { id: "grid-1", label: "1", rows: 1, cols: 1 },
+  { id: "grid-1x2", label: "1x2", rows: 1, cols: 2 },
+  { id: "grid-2x2", label: "2x2", rows: 2, cols: 2 },
+  { id: "grid-2x3", label: "6", rows: 2, cols: 3 },
+  { id: "grid-2x4", label: "8", rows: 2, cols: 4 },
+  { id: "grid-2x5", label: "10", rows: 2, cols: 5 },
+  { id: "grid-3x3", label: "3x3", rows: 3, cols: 3 },
+  { id: "grid-4x4", label: "4x4", rows: 4, cols: 4 },
 ];
+const AGENT_OPTIONS: AgentOption[] = [
+  { id: "codex", label: "Codex", defaultCommand: "codex" },
+  { id: "claude", label: "Claude", defaultCommand: "claude" },
+  { id: "gemini", label: "Gemini", defaultCommand: "gemini" },
+  { id: "custom", label: "Custom", defaultCommand: "" },
+];
+
+const getGridLayout = (id: string) =>
+  GRID_LAYOUT_OPTIONS.find((option) => option.id === id) ?? GRID_LAYOUT_OPTIONS[0];
+
+const getGridCapacity = (layout: GridLayoutOption) => layout.rows * layout.cols;
+
+const getFolderName = (path: string) => {
+  const trimmed = path.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const segments = trimmed.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? "";
+};
+
+const createDefaultAllocations = (): Record<string, AgentAllocation> => ({
+  codex: { enabled: true, count: 2, command: "codex" },
+  claude: { enabled: false, count: 0, command: "claude" },
+  gemini: { enabled: false, count: 0, command: "gemini" },
+  custom: { enabled: false, count: 0, command: "" },
+});
 
 const loadRecentProjects = (): RecentProject[] => {
   if (typeof window === "undefined") return [];
@@ -112,23 +174,6 @@ const loadSession = (): SessionSnapshot | null => {
 const saveSession = (snapshot: SessionSnapshot) => {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(SESSION_KEY, JSON.stringify(snapshot));
-};
-
-const loadCommandsMap = (): Record<string, CommandEntry[]> => {
-  if (typeof window === "undefined") return {};
-  const raw = window.localStorage.getItem(COMMANDS_KEY);
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as Record<string, CommandEntry[]>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-};
-
-const saveCommandsMap = (map: Record<string, CommandEntry[]>) => {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(COMMANDS_KEY, JSON.stringify(map));
 };
 
 const loadServersMap = (): Record<string, ServerEntry[]> => {
@@ -191,6 +236,7 @@ const saveShortcuts = (shortcuts: ShortcutSettings) => {
 };
 
 let ptyCreateQueue: Promise<void> = Promise.resolve();
+const startupCommandExecuted = new Set<string>();
 
 const enqueuePtyCreate = (task: () => Promise<void>) => {
   const next = ptyCreateQueue.then(task, task);
@@ -202,11 +248,13 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const MAX_SPLITS = 6;
 
+const createRuntimeId = (prefix: string) =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? `${prefix}-${crypto.randomUUID()}`
+    : `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+
 const createPane = (index: number): Pane => ({
-  id:
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `pane-${Math.random().toString(36).slice(2, 10)}`,
+  id: createRuntimeId("pane"),
   name: `Terminal ${index}`,
 });
 
@@ -220,6 +268,8 @@ type TerminalPaneProps = {
   onClose: (id: string) => void;
   canClose: boolean;
   cwd: string;
+  startupCommand?: string;
+  onStartupCommandConsumed: (id: string) => void;
 };
 
 function TerminalPane({
@@ -232,6 +282,8 @@ function TerminalPane({
   onClose,
   canClose,
   cwd,
+  startupCommand,
+  onStartupCommandConsumed,
 }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -308,6 +360,17 @@ function TerminalPane({
         setError("Terminal failed to start");
         setIsLoading(false);
         return;
+      }
+
+      if (startupCommand?.trim() && !startupCommandExecuted.has(id)) {
+        startupCommandExecuted.add(id);
+        try {
+          await invoke("pty_write", { id, data: `${startupCommand.trim()}\r` });
+        } catch {
+          // Ignore startup command failures; terminal remains usable.
+        } finally {
+          onStartupCommandConsumed(id);
+        }
       }
 
       const loadingTimeout = window.setTimeout(() => {
@@ -463,10 +526,6 @@ function ServerManager({ embedded = false }: ServerManagerProps) {
   >({});
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const ptyToServerRef = useRef<Record<string, string>>({});
-  const appWindow = useMemo(
-    () => (embedded ? null : getCurrentWindow()),
-    [embedded],
-  );
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -583,31 +642,23 @@ function ServerManager({ embedded = false }: ServerManagerProps) {
 
   return (
     <div className="app">
-      <header className="topbar" data-tauri-drag-region>
-        <div className="server-topbar" data-tauri-drag-region>
+      <header className="topbar">
+        <div className="server-topbar">
           <div className="server-topbar-text">
             <div className="server-topbar-title">Server Manager</div>
             <div className="server-topbar-path">
               {projectPath || "No project selected"}
             </div>
           </div>
-          <div className="server-topbar-actions" data-tauri-drag-region="false">
+          <div className="server-topbar-actions">
             <button className="btn secondary" onClick={handleChooseProject}>
               Change Project
             </button>
-            {!embedded && appWindow && (
-              <button
-                className="btn window close"
-                onClick={() => void appWindow.close()}
-              >
-                ×
-              </button>
-            )}
           </div>
         </div>
       </header>
 
-      <div className="server-shell">
+      <div className={`server-shell ${embedded ? "embedded" : ""}`}>
         <div className="server-header">
           <div>
             <div className="server-title">Servers</div>
@@ -720,19 +771,40 @@ function ServerManager({ embedded = false }: ServerManagerProps) {
 function MainApp() {
   const [panes, setPanes] = useState<Pane[]>(() => [createPane(1)]);
   const [activeId, setActiveId] = useState<string>(() => panes[0].id);
+  const [tabs, setTabs] = useState<WorkspaceTab[]>(() => {
+    const id = createRuntimeId("tab");
+    return [{ id, title: "Tab 1", snapshot: null }];
+  });
+  const [activeTabId, setActiveTabId] = useState<string>(() => tabs[0].id);
   const [layoutTick, setLayoutTick] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isMaximized, setIsMaximized] = useState(false);
   const [projectPath, setProjectPath] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("Workspace");
+  const [fixedGridLayoutId, setFixedGridLayoutId] = useState<string | null>(null);
+  const [startupCommands, setStartupCommands] = useState<Record<string, string>>({});
   const [isProjectReady, setIsProjectReady] = useState(false);
+  const [isWorkspaceSetupOpen, setIsWorkspaceSetupOpen] = useState(false);
+  const [workspaceSetupMode, setWorkspaceSetupMode] =
+    useState<WorkspaceSetupMode>("active-tab");
+  const [workspaceSetupError, setWorkspaceSetupError] = useState<string | null>(null);
+  const [workspaceSetupForm, setWorkspaceSetupForm] = useState<WorkspaceSetupForm>({
+    workspaceName: "Workspace",
+    projectPath: loadLastProject(),
+    gridLayoutId: DEFAULT_GRID_LAYOUT_ID,
+    allocations: createDefaultAllocations(),
+  });
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(() =>
     loadRecentProjects(),
   );
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isCommandsOpen, setIsCommandsOpen] = useState(false);
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [isServersInline, setIsServersInline] = useState(false);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isCheckingForUpdates, setIsCheckingForUpdates] = useState(false);
+  const [availableUpdateVersion, setAvailableUpdateVersion] = useState<string | null>(
+    null,
+  );
   const [shortcuts, setShortcuts] = useState<ShortcutSettings>(() =>
     loadShortcuts(),
   );
@@ -740,10 +812,7 @@ function MainApp() {
     shortcuts,
   );
   const [shortcutError, setShortcutError] = useState<string | null>(null);
-  const [commandsMap, setCommandsMap] = useState<
-    Record<string, CommandEntry[]>
-  >(() => loadCommandsMap());
-  const [draftCommands, setDraftCommands] = useState<CommandEntry[]>([]);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const [lastSplit, setLastSplit] = useState<"horizontal" | "vertical">(
     "horizontal",
   );
@@ -754,38 +823,196 @@ function MainApp() {
   }, [appWindow]);
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    const setup = async () => {
-      const current = await appWindow.isMaximized();
-      setIsMaximized(current);
-      unlisten = await appWindow.onResized(async () => {
-        const next = await appWindow.isMaximized();
-        setIsMaximized(next);
-      });
+    if (!isMenuOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!menuRef.current) return;
+      if (menuRef.current.contains(event.target as Node)) return;
+      setIsMenuOpen(false);
     };
-    void setup();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
     return () => {
-      if (unlisten) unlisten();
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
     };
-  }, [appWindow]);
+  }, [isMenuOpen]);
 
-  const handleMinimize = () => {
-    void appWindow.minimize();
+  const buildSnapshot = (
+    nextProjectPath: string,
+    nextWorkspaceName: string,
+    nextPanes: Pane[],
+    nextActiveId: string,
+    nextLastSplit: "horizontal" | "vertical",
+    nextGridLayoutId: string | null,
+  ): SessionSnapshot | null => {
+    if (!nextProjectPath.trim() || nextPanes.length === 0) return null;
+    return {
+      projectPath: nextProjectPath,
+      workspaceName: nextWorkspaceName,
+      panes: nextPanes.map((pane) => ({ id: pane.id, name: pane.name })),
+      activeId: nextActiveId,
+      lastSplit: nextLastSplit,
+      gridLayoutId: nextGridLayoutId ?? undefined,
+      updatedAt: Date.now(),
+    };
   };
 
-  const handleToggleMaximize = async () => {
-    const isMax = await appWindow.isMaximized();
-    if (isMax) {
-      await appWindow.unmaximize();
-      setIsMaximized(false);
-    } else {
-      await appWindow.maximize();
-      setIsMaximized(true);
+  useEffect(() => {
+    if (!activeTabId) return;
+    const snapshot = isProjectReady
+      ? buildSnapshot(
+          projectPath,
+          workspaceName,
+          panes,
+          activeId,
+          lastSplit,
+          fixedGridLayoutId,
+        )
+      : null;
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === activeTabId
+          ? {
+              ...tab,
+              snapshot,
+            }
+          : tab,
+      ),
+    );
+  }, [
+    activeTabId,
+    isProjectReady,
+    projectPath,
+    workspaceName,
+    panes,
+    activeId,
+    lastSplit,
+    fixedGridLayoutId,
+  ]);
+
+  const loadTabRuntime = (target: WorkspaceTab) => {
+    startupCommandExecuted.clear();
+    setStartupCommands({});
+
+    if (target.snapshot) {
+      const snapshot = target.snapshot;
+      setProjectPath(snapshot.projectPath);
+      setWorkspaceName(
+        snapshot.workspaceName?.trim() ||
+          getFolderName(snapshot.projectPath) ||
+          target.title,
+      );
+      setIsProjectReady(true);
+      setPanes(
+        snapshot.panes.map((pane, index) => ({
+          id: pane.id,
+          name: pane.name || `Terminal ${index + 1}`,
+        })),
+      );
+      setActiveId(
+        snapshot.panes.some((pane) => pane.id === snapshot.activeId)
+          ? snapshot.activeId
+          : snapshot.panes[0].id,
+      );
+      setLastSplit(snapshot.lastSplit ?? "horizontal");
+      setFixedGridLayoutId(snapshot.gridLayoutId ?? null);
+      setWorkspaceSetupForm((current) => ({
+        ...current,
+        workspaceName:
+          snapshot.workspaceName?.trim() ||
+          getFolderName(snapshot.projectPath) ||
+          target.title,
+        projectPath: snapshot.projectPath,
+        gridLayoutId: snapshot.gridLayoutId ?? current.gridLayoutId,
+      }));
+      setLayoutTick((tick) => tick + 1);
+      return;
     }
+
+    const pane = createPane(1);
+    setProjectPath("");
+    setWorkspaceName(target.title);
+    setIsProjectReady(false);
+    setPanes([pane]);
+    setActiveId(pane.id);
+    setLastSplit("horizontal");
+    setFixedGridLayoutId(null);
+    setWorkspaceSetupForm((current) => ({
+      ...current,
+      workspaceName: target.title,
+      projectPath: loadLastProject(),
+    }));
+    setLayoutTick((tick) => tick + 1);
   };
 
-  const handleCloseWindow = () => {
-    void appWindow.close();
+  const handleSelectTab = (tabId: string) => {
+    if (tabId === activeTabId) return;
+    const target = tabs.find((tab) => tab.id === tabId);
+    if (!target) return;
+
+    const currentSnapshot = isProjectReady
+      ? buildSnapshot(
+          projectPath,
+          workspaceName,
+          panes,
+          activeId,
+          lastSplit,
+          fixedGridLayoutId,
+        )
+      : null;
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === activeTabId
+          ? {
+              ...tab,
+              snapshot: currentSnapshot,
+            }
+          : tab,
+      ),
+    );
+
+    setActiveTabId(tabId);
+    setIsMenuOpen(false);
+    loadTabRuntime(target);
+  };
+
+  const handleRenameTab = (tabId: string) => {
+    const target = tabs.find((tab) => tab.id === tabId);
+    if (!target || typeof window === "undefined") return;
+    const next = window.prompt("Rename tab", target.title)?.trim();
+    if (!next) return;
+    setTabs((current) =>
+      current.map((tab) => (tab.id === tabId ? { ...tab, title: next } : tab)),
+    );
+    if (tabId === activeTabId && !isProjectReady) {
+      setWorkspaceName(next);
+      setWorkspaceSetupForm((current) => ({ ...current, workspaceName: next }));
+    }
+    setIsMenuOpen(false);
+  };
+
+  const handleDeleteTab = (tabId: string) => {
+    if (tabs.length <= 1) return;
+    const index = tabs.findIndex((tab) => tab.id === tabId);
+    if (index === -1) return;
+    const filtered = tabs.filter((tab) => tab.id !== tabId);
+    const fallback =
+      filtered[Math.max(0, index - 1)] ?? filtered[0] ?? null;
+
+    setTabs(filtered);
+    if (tabId !== activeTabId || !fallback) {
+      setIsMenuOpen(false);
+      return;
+    }
+
+    setActiveTabId(fallback.id);
+    loadTabRuntime(fallback);
+    setIsMenuOpen(false);
   };
 
   useEffect(() => {
@@ -798,12 +1025,22 @@ function MainApp() {
     if (!isProjectReady || !projectPath || panes.length === 0) return;
     saveSession({
       projectPath,
+      workspaceName,
       panes: panes.map((pane) => ({ id: pane.id, name: pane.name })),
       activeId,
       lastSplit,
+      gridLayoutId: fixedGridLayoutId ?? undefined,
       updatedAt: Date.now(),
     });
-  }, [projectPath, isProjectReady, panes, activeId, lastSplit]);
+  }, [
+    projectPath,
+    workspaceName,
+    fixedGridLayoutId,
+    isProjectReady,
+    panes,
+    activeId,
+    lastSplit,
+  ]);
 
   useEffect(() => {
     if (!isSettingsOpen) return;
@@ -811,30 +1048,308 @@ function MainApp() {
     setShortcutError(null);
   }, [isSettingsOpen, shortcuts]);
 
-  useEffect(() => {
-    if (!isCommandsOpen) return;
-    const existing = commandsMap[projectPath] ?? DEFAULT_COMMANDS;
-    setDraftCommands(existing.map((item) => ({ ...item })));
-  }, [isCommandsOpen, commandsMap, projectPath]);
+  const selectedWorkspaceGrid = useMemo(
+    () => getGridLayout(workspaceSetupForm.gridLayoutId),
+    [workspaceSetupForm.gridLayoutId],
+  );
 
-  const handleChooseProject = async () => {
+  const workspaceGridCapacity = getGridCapacity(selectedWorkspaceGrid);
+
+  useEffect(() => {
+    setWorkspaceSetupForm((current) => {
+      const nextAllocations = { ...current.allocations };
+      let changed = false;
+      AGENT_OPTIONS.forEach((option) => {
+        const allocation = nextAllocations[option.id] ?? {
+          enabled: false,
+          count: 0,
+          command: option.defaultCommand,
+        };
+        const normalizedCommand =
+          allocation.command.trim() || option.defaultCommand;
+        const normalizedCount = allocation.enabled
+          ? Math.max(1, Math.min(allocation.count || 1, workspaceGridCapacity))
+          : 0;
+        if (
+          normalizedCount !== allocation.count ||
+          normalizedCommand !== allocation.command
+        ) {
+          changed = true;
+          nextAllocations[option.id] = {
+            ...allocation,
+            count: normalizedCount,
+            command: normalizedCommand,
+          };
+        } else {
+          nextAllocations[option.id] = allocation;
+        }
+      });
+      if (!changed) return current;
+      return { ...current, allocations: nextAllocations };
+    });
+  }, [workspaceGridCapacity]);
+
+  const updateRecentProjects = (path: string) => {
+    const next = [
+      { path, lastOpened: Date.now() },
+      ...recentProjects.filter((item) => item.path !== path),
+    ].slice(0, MAX_RECENTS);
+    setRecentProjects(next);
+    saveRecentProjects(next);
+  };
+
+  const handleBrowseWorkspaceFolder = async () => {
     const selected = await open({
       directory: true,
       multiple: false,
       title: "Select Project Folder",
     });
-    if (typeof selected === "string" && selected.trim()) {
-      const path = selected.trim();
-      setProjectPath(path);
-      saveLastProject(path);
-      setIsProjectReady(true);
-      const next = [
-        { path, lastOpened: Date.now() },
-        ...recentProjects.filter((item) => item.path !== path),
-      ].slice(0, MAX_RECENTS);
-      setRecentProjects(next);
-      saveRecentProjects(next);
+    if (typeof selected !== "string" || !selected.trim()) return;
+    const path = selected.trim();
+    const suggestedWorkspace = getFolderName(path);
+    setWorkspaceSetupForm((current) => ({
+      ...current,
+      projectPath: path,
+      workspaceName: current.workspaceName.trim()
+        ? current.workspaceName
+        : suggestedWorkspace || current.workspaceName,
+    }));
+  };
+
+  const openWorkspaceSetup = (
+    mode: WorkspaceSetupMode = "active-tab",
+    seedName?: string,
+  ) => {
+    setWorkspaceSetupMode(mode);
+    const currentPath =
+      mode === "new-tab"
+        ? loadLastProject()
+        : projectPath || workspaceSetupForm.projectPath || loadLastProject();
+    const fallbackWorkspace =
+      seedName || getFolderName(currentPath) || workspaceName || "Workspace";
+    setWorkspaceSetupForm((current) => ({
+      ...current,
+      projectPath: currentPath,
+      workspaceName: current.workspaceName.trim()
+        ? mode === "new-tab"
+          ? fallbackWorkspace
+          : current.workspaceName
+        : fallbackWorkspace,
+      gridLayoutId:
+        mode === "new-tab"
+          ? DEFAULT_GRID_LAYOUT_ID
+          : fixedGridLayoutId ?? current.gridLayoutId,
+      allocations:
+        mode === "new-tab" ? createDefaultAllocations() : current.allocations,
+    }));
+    setWorkspaceSetupError(null);
+    setIsMenuOpen(false);
+    setIsWorkspaceSetupOpen(true);
+  };
+
+  const updateAgentAllocation = (
+    agentId: string,
+    next: Partial<AgentAllocation>,
+  ) => {
+    setWorkspaceSetupError(null);
+    setWorkspaceSetupForm((current) => {
+      const agent = AGENT_OPTIONS.find((option) => option.id === agentId);
+      if (!agent) return current;
+      const existing = current.allocations[agentId] ?? {
+        enabled: false,
+        count: 0,
+        command: agent.defaultCommand,
+      };
+      const merged = { ...existing, ...next };
+      return {
+        ...current,
+        allocations: {
+          ...current.allocations,
+          [agentId]: merged,
+        },
+      };
+    });
+  };
+
+  const totalAssignedPanels = useMemo(
+    () =>
+      AGENT_OPTIONS.reduce((sum, option) => {
+        const allocation = workspaceSetupForm.allocations[option.id];
+        if (!allocation?.enabled) return sum;
+        return sum + Math.max(1, allocation.count || 1);
+      }, 0),
+    [workspaceSetupForm.allocations],
+  );
+
+  const handleWorkspaceLaunch = () => {
+    const path = workspaceSetupForm.projectPath.trim();
+    if (!path) {
+      setWorkspaceSetupError("Choose a folder path before launching.");
+      return;
     }
+
+    const layout = getGridLayout(workspaceSetupForm.gridLayoutId);
+    const capacity = getGridCapacity(layout);
+    const enabledAgents = AGENT_OPTIONS.map((option) => {
+      const allocation = workspaceSetupForm.allocations[option.id] ?? {
+        enabled: false,
+        count: 0,
+        command: option.defaultCommand,
+      };
+      if (!allocation.enabled) return null;
+      const count = Math.max(1, Math.min(allocation.count || 1, capacity));
+      const command = (allocation.command || option.defaultCommand).trim();
+      if (!command) {
+        return {
+          option,
+          count,
+          command,
+          invalidCommand: true,
+        };
+      }
+      return {
+        option,
+        count,
+        command,
+        invalidCommand: false,
+      };
+    }).filter((item): item is {
+      option: AgentOption;
+      count: number;
+      command: string;
+      invalidCommand: boolean;
+    } => Boolean(item));
+
+    const invalidAgent = enabledAgents.find((agent) => agent.invalidCommand);
+    if (invalidAgent) {
+      setWorkspaceSetupError(
+        `Enter a valid CLI command for ${invalidAgent.option.label}.`,
+      );
+      return;
+    }
+
+    const assignedPanels = enabledAgents.reduce(
+      (sum, agent) => sum + agent.count,
+      0,
+    );
+    if (assignedPanels > capacity) {
+      setWorkspaceSetupError(
+        `Assigned panels (${assignedPanels}) exceed selected layout capacity (${capacity}).`,
+      );
+      return;
+    }
+
+    const resolvedWorkspaceName =
+      workspaceSetupForm.workspaceName.trim() ||
+      getFolderName(path) ||
+      "Workspace";
+    const nextPanes: Pane[] = Array.from({ length: capacity }, (_, index) => {
+      const pane = createPane(index + 1);
+      return {
+        ...pane,
+        name: `${resolvedWorkspaceName} - Terminal ${index + 1}`,
+      };
+    });
+
+    const nextStartupCommands: Record<string, string> = {};
+    let paneCursor = 0;
+    enabledAgents.forEach((agent) => {
+      for (let index = 0; index < agent.count; index += 1) {
+        const pane = nextPanes[paneCursor];
+        if (!pane) break;
+        pane.name = `${resolvedWorkspaceName} - ${agent.option.label} ${index + 1}`;
+        nextStartupCommands[pane.id] = agent.command;
+        paneCursor += 1;
+      }
+    });
+
+    const nextSplit = layout.rows >= layout.cols ? "horizontal" : "vertical";
+    const nextSnapshot = buildSnapshot(
+      path,
+      resolvedWorkspaceName,
+      nextPanes,
+      nextPanes[0].id,
+      nextSplit,
+      layout.id,
+    );
+    if (workspaceSetupMode === "new-tab") {
+      const nextTabId = createRuntimeId("tab");
+      const currentSnapshot = isProjectReady
+        ? buildSnapshot(
+            projectPath,
+            workspaceName,
+            panes,
+            activeId,
+            lastSplit,
+            fixedGridLayoutId,
+          )
+        : null;
+      setTabs((current) => {
+        const withCurrent = current.map((tab) =>
+          tab.id === activeTabId
+            ? {
+                ...tab,
+                title: workspaceName.trim() || tab.title,
+                snapshot: currentSnapshot,
+              }
+            : tab,
+        );
+        return [
+          ...withCurrent,
+          {
+            id: nextTabId,
+            title: resolvedWorkspaceName,
+            snapshot: nextSnapshot,
+          },
+        ];
+      });
+      setActiveTabId(nextTabId);
+    } else {
+      setTabs((current) =>
+        current.map((tab) =>
+          tab.id === activeTabId
+            ? {
+                ...tab,
+                title: resolvedWorkspaceName,
+                snapshot: nextSnapshot,
+              }
+            : tab,
+        ),
+      );
+    }
+
+    startupCommandExecuted.clear();
+    setWorkspaceName(resolvedWorkspaceName);
+    setProjectPath(path);
+    setPanes(nextPanes);
+    setActiveId(nextPanes[0].id);
+    setLayoutTick((tick) => tick + 1);
+    setFixedGridLayoutId(layout.id);
+    setLastSplit(nextSplit);
+    setStartupCommands(nextStartupCommands);
+    saveLastProject(path);
+    setIsProjectReady(true);
+    setIsWorkspaceSetupOpen(false);
+    setWorkspaceSetupMode("active-tab");
+    setIsMenuOpen(false);
+    setWorkspaceSetupError(null);
+    updateRecentProjects(path);
+  };
+
+  const openExistingProject = (path: string) => {
+    const pane = createPane(1);
+    startupCommandExecuted.clear();
+    setProjectPath(path);
+    setWorkspaceName(getFolderName(path) || "Workspace");
+    setIsProjectReady(true);
+    setFixedGridLayoutId(null);
+    setStartupCommands({});
+    setPanes([pane]);
+    setActiveId(pane.id);
+    setLayoutTick((tick) => tick + 1);
+    saveLastProject(path);
+    setIsMenuOpen(false);
+    updateRecentProjects(path);
   };
 
   const getGrid = (count: number, preferred: "horizontal" | "vertical") => {
@@ -971,12 +1486,28 @@ function MainApp() {
   }, [panes.length]);
 
   const handleClose = (id: string) => {
+    startupCommandExecuted.delete(id);
     setPanes((current) => {
       if (current.length <= 1) return current;
       const next = current.filter((pane) => pane.id !== id);
       return next;
     });
+    setStartupCommands((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
     setLayoutTick((tick) => tick + 1);
+  };
+
+  const handleStartupCommandConsumed = (id: string) => {
+    setStartupCommands((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
   };
 
   const handleRename = (id: string, name: string) => {
@@ -985,26 +1516,9 @@ function MainApp() {
     );
   };
 
-  const getProjectCommands = (path: string) =>
-    commandsMap[path] ?? DEFAULT_COMMANDS;
-
   const handleRunCommand = async (command: string) => {
     if (!isProjectReady || !activeId) return;
     await invoke("pty_write", { id: activeId, data: `${command}\r` });
-  };
-
-  const handleCommandsSave = () => {
-    const trimmed = draftCommands
-      .map((item) => ({
-        ...item,
-        label: item.label.trim(),
-        command: item.command.trim(),
-      }))
-      .filter((item) => item.label && item.command);
-    const next = { ...commandsMap, [projectPath]: trimmed };
-    setCommandsMap(next);
-    saveCommandsMap(next);
-    setIsCommandsOpen(false);
   };
 
   const handleShortcutChange = (
@@ -1057,7 +1571,7 @@ function MainApp() {
     }
     try {
       const serverWindow = new WebviewWindow("servers", {
-        title: "Greepy Servers",
+        title: "Servers",
         width: 1000,
         height: 720,
         resizable: true,
@@ -1081,6 +1595,80 @@ function MainApp() {
     }
   };
 
+  const formatErrorMessage = (error: unknown) =>
+    error instanceof Error ? error.message : String(error);
+
+  const handleCheckForUpdates = async (silent = false) => {
+    if (isCheckingForUpdates) return;
+    setIsCheckingForUpdates(true);
+    let update: Awaited<ReturnType<typeof check>> = null;
+    try {
+      update = await check();
+      if (!update) {
+        setAvailableUpdateVersion(null);
+        if (!silent) {
+          await message("You are already on the latest version.", {
+            title: "No Updates Available",
+            kind: "info",
+          });
+        }
+        return;
+      }
+
+      setAvailableUpdateVersion(update.version);
+      if (silent) return;
+
+      const shouldInstall = await confirm(
+        `Version ${update.version} is available. Download and install now?`,
+        {
+          title: "Update Available",
+          kind: "info",
+          okLabel: "Install",
+          cancelLabel: "Later",
+        },
+      );
+      if (!shouldInstall) return;
+
+      await update.downloadAndInstall();
+      setAvailableUpdateVersion(null);
+
+      const shouldRestart = await confirm(
+        "Update installed successfully. Restart now to finish applying it?",
+        {
+          title: "Restart Required",
+          kind: "info",
+          okLabel: "Restart",
+          cancelLabel: "Later",
+        },
+      );
+      if (shouldRestart) {
+        await relaunch();
+      }
+    } catch (error) {
+      if (!silent) {
+        await message(`Unable to check for updates.\n\n${formatErrorMessage(error)}`, {
+          title: "Update Error",
+          kind: "error",
+        });
+      }
+    } finally {
+      if (update) {
+        try {
+          await update.close();
+        } catch {
+          // Ignore cleanup errors after updater calls.
+        }
+      }
+      setIsCheckingForUpdates(false);
+    }
+  };
+
+  useEffect(() => {
+    void handleCheckForUpdates(true);
+    // Run once on app launch to surface pending updates in the menu.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const paletteActions = useMemo(() => {
     const actions: Array<{
       id: string;
@@ -1090,9 +1678,9 @@ function MainApp() {
     }> = [
       {
         id: "open-project",
-        label: "Open project folder",
+        label: "Open workspace setup",
         run: () => {
-          void handleChooseProject();
+          openWorkspaceSetup();
           setIsPaletteOpen(false);
         },
       },
@@ -1157,37 +1745,14 @@ function MainApp() {
             setIsPaletteOpen(false);
           },
         },
-        {
-          id: "open-commands",
-          label: "Manage quick commands",
-          run: () => {
-            setIsCommandsOpen(true);
-            setIsPaletteOpen(false);
-          },
-        },
       );
-
-      const commands = getProjectCommands(projectPath);
-      commands.forEach((entry) => {
-        actions.push({
-          id: `cmd-${entry.id}`,
-          label: entry.label,
-          hint: entry.command,
-          run: () => {
-            void handleRunCommand(entry.command);
-            setIsPaletteOpen(false);
-          },
-        });
-      });
     }
 
     return actions;
   }, [
     activeId,
-    commandsMap,
-    handleChooseProject,
     isProjectReady,
-    projectPath,
+    openWorkspaceSetup,
     shortcuts.splitHorizontalKey,
     shortcuts.splitVerticalKey,
   ]);
@@ -1215,20 +1780,218 @@ function MainApp() {
     return matches;
   }, [paletteActions, paletteQuery, isProjectReady]);
 
+  const workspaceSetupModal = isWorkspaceSetupOpen ? (
+    <div className="modal-backdrop" onClick={() => setIsWorkspaceSetupOpen(false)}>
+      <div
+        className="modal workspace-setup-modal"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <div>
+            <div className="modal-title">Open Workspace</div>
+            <div className="modal-subtitle">
+              Pick folder, layout, and coding agent instances in one action.
+            </div>
+          </div>
+          <button
+            className="btn"
+            onClick={() => setIsWorkspaceSetupOpen(false)}
+            aria-label="Close workspace setup"
+          >
+            ×
+          </button>
+        </div>
+        <form
+          className="modal-body workspace-setup-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            handleWorkspaceLaunch();
+          }}
+        >
+          <label className="workspace-field">
+            <span>Workspace Name</span>
+            <input
+              value={workspaceSetupForm.workspaceName}
+              onChange={(event) =>
+                setWorkspaceSetupForm((current) => ({
+                  ...current,
+                  workspaceName: event.target.value,
+                }))
+              }
+              placeholder="My Workspace"
+            />
+          </label>
+
+          <label className="workspace-field">
+            <span>Folder Path</span>
+            <div className="workspace-path-row">
+              <input
+                value={workspaceSetupForm.projectPath}
+                onChange={(event) =>
+                  setWorkspaceSetupForm((current) => ({
+                    ...current,
+                    projectPath: event.target.value,
+                  }))
+                }
+                placeholder="C:\\path\\to\\project"
+              />
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => void handleBrowseWorkspaceFolder()}
+              >
+                Browse
+              </button>
+            </div>
+          </label>
+
+          <div className="workspace-grid-row">
+            <label className="workspace-field">
+              <span>Grid Layout</span>
+              <select
+                value={workspaceSetupForm.gridLayoutId}
+                onChange={(event) =>
+                  setWorkspaceSetupForm((current) => ({
+                    ...current,
+                    gridLayoutId: event.target.value,
+                  }))
+                }
+              >
+                {GRID_LAYOUT_OPTIONS.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label} ({getGridCapacity(option)} panes max)
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="workspace-field">
+              <span>Panel Capacity</span>
+              <div className="workspace-capacity-value">
+                {workspaceGridCapacity} panels
+              </div>
+            </div>
+          </div>
+
+          <div className="workspace-field">
+            <span>CLI Agent Allocation</span>
+            <div className="agent-allocation-list">
+              {AGENT_OPTIONS.map((option) => {
+                const allocation = workspaceSetupForm.allocations[option.id] ?? {
+                  enabled: false,
+                  count: 0,
+                  command: option.defaultCommand,
+                };
+                const ownCount = allocation.enabled
+                  ? Math.max(1, allocation.count || 1)
+                  : 0;
+                const assignedToOthers = totalAssignedPanels - ownCount;
+                const maxForThisAgent = Math.max(
+                  1,
+                  workspaceGridCapacity - assignedToOthers,
+                );
+                return (
+                  <div className="agent-allocation-row" key={option.id}>
+                    <label className="agent-allocation-toggle">
+                      <input
+                        type="checkbox"
+                        checked={allocation.enabled}
+                        onChange={(event) =>
+                          updateAgentAllocation(option.id, {
+                            enabled: event.target.checked,
+                            count: event.target.checked
+                              ? Math.max(
+                                  1,
+                                  Math.min(allocation.count || 1, maxForThisAgent),
+                                )
+                              : 0,
+                          })
+                        }
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                    <div className="agent-allocation-count">
+                      <input
+                        type="number"
+                        min={1}
+                        max={maxForThisAgent}
+                        value={allocation.enabled ? ownCount : 0}
+                        disabled={!allocation.enabled}
+                        onChange={(event) => {
+                          const parsed = Number.parseInt(event.target.value, 10);
+                          const normalized = Number.isNaN(parsed)
+                            ? 1
+                            : Math.max(1, Math.min(parsed, maxForThisAgent));
+                          updateAgentAllocation(option.id, {
+                            enabled: true,
+                            count: normalized,
+                          });
+                        }}
+                      />
+                      <span className="workspace-helper">panels</span>
+                    </div>
+                    <input
+                      className="agent-command-input"
+                      value={allocation.command}
+                      onChange={(event) =>
+                        updateAgentAllocation(option.id, {
+                          command: event.target.value,
+                        })
+                      }
+                      placeholder={
+                        option.defaultCommand || "custom-agent --project ."
+                      }
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div
+              className={
+                totalAssignedPanels > workspaceGridCapacity
+                  ? "field-error"
+                  : "workspace-helper"
+              }
+            >
+              Assigned agent panels: {totalAssignedPanels} / {workspaceGridCapacity}
+            </div>
+            <div className="workspace-helper">
+              Unassigned panels open as normal terminals.
+            </div>
+          </div>
+
+          {workspaceSetupError && <div className="field-error">{workspaceSetupError}</div>}
+
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={() => setIsWorkspaceSetupOpen(false)}
+            >
+              Cancel
+            </button>
+            <button type="submit" className="btn primary">
+              Enter
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  ) : null;
+
   if (!isProjectReady) {
     return (
       <div className="app">
         <div className="project-screen">
           <div className="project-shell">
             <div className="project-header">
-              <div className="brand-title">Greepy</div>
+              <div className="brand-title">Workspace</div>
               <div className="brand-subtitle">
                 Modular workspace. Start with a project, then add tools.
               </div>
             </div>
             <div className="project-actions">
-              <button className="btn primary" onClick={handleChooseProject}>
-                Open Project Folder
+              <button className="btn primary" onClick={() => openWorkspaceSetup()}>
+                Open Folder
               </button>
               {projectPath && <div className="project-path">{projectPath}</div>}
             </div>
@@ -1238,7 +2001,13 @@ function MainApp() {
                 onClick={() => {
                   const snapshot = loadSession();
                   if (!snapshot) return;
+                  startupCommandExecuted.clear();
                   setProjectPath(snapshot.projectPath);
+                  setWorkspaceName(
+                    snapshot.workspaceName?.trim() ||
+                      getFolderName(snapshot.projectPath) ||
+                      "Workspace",
+                  );
                   setIsProjectReady(true);
                   setPanes(
                     snapshot.panes.map((pane, index) => ({
@@ -1252,15 +2021,11 @@ function MainApp() {
                       : snapshot.panes[0].id,
                   );
                   setLastSplit(snapshot.lastSplit ?? "horizontal");
+                  setFixedGridLayoutId(snapshot.gridLayoutId ?? null);
+                  setStartupCommands({});
+                  setIsMenuOpen(false);
                   saveLastProject(snapshot.projectPath);
-                  const next = [
-                    { path: snapshot.projectPath, lastOpened: Date.now() },
-                    ...recentProjects.filter(
-                      (item) => item.path !== snapshot.projectPath,
-                    ),
-                  ].slice(0, MAX_RECENTS);
-                  setRecentProjects(next);
-                  saveRecentProjects(next);
+                  updateRecentProjects(snapshot.projectPath);
                 }}
               >
                 Resume last session
@@ -1274,18 +2039,7 @@ function MainApp() {
                     <button
                       key={project.path}
                       className="recent-item"
-                      onClick={() => {
-                        setProjectPath(project.path);
-                        setIsProjectReady(true);
-                        const next = [
-                          { path: project.path, lastOpened: Date.now() },
-                          ...recentProjects.filter(
-                            (item) => item.path !== project.path,
-                          ),
-                        ].slice(0, MAX_RECENTS);
-                        setRecentProjects(next);
-                        saveRecentProjects(next);
-                      }}
+                      onClick={() => openExistingProject(project.path)}
                       title={project.path}
                     >
                       <span className="recent-name">{project.path}</span>
@@ -1319,101 +2073,172 @@ function MainApp() {
             </div>
           </div>
         </div>
+        {workspaceSetupModal}
       </div>
     );
   }
 
-  const grid = getGrid(panes.length, lastSplit);
+  const handleMenuAction = (run: () => void) => {
+    run();
+    setIsMenuOpen(false);
+  };
 
   return (
     <div className={`app ${isFullscreen ? "fullscreen" : ""}`}>
-      <header className="topbar" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region>
-          <span className="brand-title" data-tauri-drag-region>
-            Greepy
-          </span>
+      <header className="topbar">
+        <div className="topbar-tabs">
+          {tabs.map((tab) => (
+            <div
+              key={tab.id}
+              className={`topbar-tab ${tab.id === activeTabId ? "active" : ""}`}
+              title={tab.snapshot?.projectPath || tab.title}
+            >
+              <button
+                className="topbar-tab-main"
+                onClick={() => handleSelectTab(tab.id)}
+                onDoubleClick={() => handleRenameTab(tab.id)}
+              >
+                {tab.title}
+              </button>
+              {tabs.length > 1 && (
+                <button
+                  className="topbar-tab-close"
+                  onClick={() => handleDeleteTab(tab.id)}
+                  title="Delete tab"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+          <button
+            className="topbar-tab add"
+            onClick={() =>
+              openWorkspaceSetup("new-tab", `Tab ${tabs.length + 1}`)
+            }
+            title="New tab"
+          >
+            +
+          </button>
         </div>
-        <div className="command-hints" data-tauri-drag-region />
-        <div className="topbar-actions" data-tauri-drag-region="false">
+        <div className="topbar-drag-zone" />
+        <div className="topbar-menu" ref={menuRef}>
           <button
             className="btn secondary"
-            onClick={() => setIsCommandsOpen(true)}
-            data-tauri-drag-region="false"
+            onClick={() => setIsMenuOpen((current) => !current)}
           >
-            Commands
+            Menu
           </button>
-          <button
-            className="btn secondary"
-            onClick={handleOpenServersWindow}
-            data-tauri-drag-region="false"
-          >
-            Servers
-          </button>
-          <button
-            className="btn secondary"
-            onClick={() => setIsSettingsOpen(true)}
-            data-tauri-drag-region="false"
-          >
-            Settings
-          </button>
-        </div>
-        <div className="window-controls" data-tauri-drag-region>
-          <button className="btn window minimize" onClick={handleMinimize}>
-            _
-          </button>
-          <button className="btn window maximize" onClick={handleToggleMaximize}>
-            {isMaximized ? "❐" : "□"}
-          </button>
-          <button className="btn window close" onClick={handleCloseWindow}>
-            ×
-          </button>
+          {isMenuOpen && (
+            <div className="topbar-dropdown">
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(openWorkspaceSetup)}
+              >
+                Open Folder
+              </button>
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => handleRenameTab(activeTabId))}
+              >
+                Rename Tab
+              </button>
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => handleDeleteTab(activeTabId))}
+              >
+                Delete Tab
+              </button>
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => setIsSettingsOpen(true))}
+              >
+                Settings
+              </button>
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => void handleOpenServersWindow())}
+              >
+                Servers
+              </button>
+              <button
+                className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => void handleCheckForUpdates())}
+                disabled={isCheckingForUpdates}
+              >
+                {isCheckingForUpdates
+                  ? "Checking for Updates..."
+                  : availableUpdateVersion
+                    ? `Update Available (${availableUpdateVersion})`
+                    : "Check for Updates"}
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
-      <div className="command-bar">
-        <div className="command-bar-label">Quick Commands</div>
-        <div className="command-bar-actions">
-          {getProjectCommands(projectPath).map((entry) => (
-            <button
-              key={entry.id}
-              className="btn secondary"
-              onClick={() => void handleRunCommand(entry.command)}
-              title={entry.command}
+      <div className="tab-surfaces">
+        {tabs.map((tab) => {
+          const snapshot =
+            tab.id === activeTabId
+              ? buildSnapshot(
+                  projectPath,
+                  workspaceName,
+                  panes,
+                  activeId,
+                  lastSplit,
+                  fixedGridLayoutId,
+                )
+              : tab.snapshot;
+          if (!snapshot) return null;
+
+          const tabPanes: Pane[] = snapshot.panes.map((pane, index) => ({
+            id: pane.id,
+            name: pane.name || `Terminal ${index + 1}`,
+          }));
+          const tabFixedGrid =
+            snapshot.gridLayoutId &&
+            tabPanes.length <= getGridCapacity(getGridLayout(snapshot.gridLayoutId))
+              ? getGridLayout(snapshot.gridLayoutId)
+              : null;
+          const tabGrid = tabFixedGrid
+            ? { rows: tabFixedGrid.rows, cols: tabFixedGrid.cols }
+            : getGrid(tabPanes.length, snapshot.lastSplit ?? "horizontal");
+          const isTabActive = tab.id === activeTabId;
+
+          return (
+            <section
+              key={tab.id}
+              className={`grid tab-surface ${isTabActive ? "active" : "hidden"}`}
+              style={{
+                gridTemplateColumns: `repeat(${tabGrid.cols}, minmax(0, 1fr))`,
+                gridTemplateRows: `repeat(${tabGrid.rows}, minmax(0, 1fr))`,
+              }}
             >
-              {entry.label}
-            </button>
-          ))}
-          <button
-            className="btn secondary"
-            onClick={() => setIsCommandsOpen(true)}
-          >
-            Edit
-          </button>
-        </div>
+              {tabPanes.map((pane) => (
+                <TerminalPane
+                  key={pane.id}
+                  id={pane.id}
+                  name={pane.name}
+                  onRename={isTabActive ? handleRename : () => undefined}
+                  layoutTick={layoutTick}
+                  isActive={isTabActive && pane.id === activeId}
+                  onSelect={isTabActive ? (id) => setActiveId(id) : () => undefined}
+                  onClose={isTabActive ? handleClose : () => undefined}
+                  canClose={isTabActive && tabPanes.length > 1}
+                  cwd={snapshot.projectPath}
+                  startupCommand={isTabActive ? startupCommands[pane.id] : undefined}
+                  onStartupCommandConsumed={
+                    isTabActive ? handleStartupCommandConsumed : () => undefined
+                  }
+                />
+              ))}
+            </section>
+          );
+        })}
       </div>
 
-      <section
-        className="grid"
-        style={{
-          gridTemplateColumns: `repeat(${grid.cols}, minmax(0, 1fr))`,
-          gridTemplateRows: `repeat(${grid.rows}, minmax(0, 1fr))`,
-        }}
-      >
-        {panes.map((pane) => (
-          <TerminalPane
-            key={pane.id}
-            id={pane.id}
-            name={pane.name}
-            onRename={handleRename}
-            layoutTick={layoutTick}
-            isActive={pane.id === activeId}
-            onSelect={(id) => setActiveId(id)}
-            onClose={handleClose}
-            canClose={panes.length > 1}
-            cwd={projectPath}
-          />
-        ))}
-      </section>
+      {workspaceSetupModal}
 
       {isSettingsOpen && (
         <div className="modal-backdrop" onClick={() => setIsSettingsOpen(false)}>
@@ -1476,83 +2301,6 @@ function MainApp() {
             </div>
             <div className="modal-actions">
               <button className="btn primary" onClick={handleSaveShortcuts}>
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {isCommandsOpen && (
-        <div className="modal-backdrop" onClick={() => setIsCommandsOpen(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <div>
-                <div className="modal-title">Quick Commands</div>
-                <div className="modal-subtitle">
-                  Add commands for this project.
-                </div>
-              </div>
-              <button
-                className="btn"
-                onClick={() => setIsCommandsOpen(false)}
-                aria-label="Close commands"
-              >
-                ×
-              </button>
-            </div>
-            <div className="modal-body">
-              {draftCommands.map((entry, index) => (
-                <div className="command-row" key={entry.id}>
-                  <input
-                    value={entry.label}
-                    placeholder="Label"
-                    onChange={(event) => {
-                      const next = [...draftCommands];
-                      next[index] = { ...entry, label: event.target.value };
-                      setDraftCommands(next);
-                    }}
-                  />
-                  <input
-                    value={entry.command}
-                    placeholder="Command"
-                    onChange={(event) => {
-                      const next = [...draftCommands];
-                      next[index] = { ...entry, command: event.target.value };
-                      setDraftCommands(next);
-                    }}
-                  />
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      const next = draftCommands.filter(
-                        (item) => item.id !== entry.id,
-                      );
-                      setDraftCommands(next);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-              <button
-                className="btn secondary"
-                onClick={() => {
-                  setDraftCommands((current) => [
-                    ...current,
-                    {
-                      id: `cmd-${Date.now()}`,
-                      label: "",
-                      command: "",
-                    },
-                  ]);
-                }}
-              >
-                Add command
-              </button>
-            </div>
-            <div className="modal-actions">
-              <button className="btn primary" onClick={handleCommandsSave}>
                 Save
               </button>
             </div>
