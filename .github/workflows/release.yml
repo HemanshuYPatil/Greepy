@@ -43,6 +43,37 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare bundled Whisper resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repoRoot = $PWD
+          $workDir = Join-Path $env:RUNNER_TEMP "whispercpp"
+          if (Test-Path $workDir) {
+            Remove-Item -Recurse -Force $workDir
+          }
+
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp $workDir
+          Push-Location $workDir
+          .\models\download-ggml-model.cmd tiny.en
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --target whisper-cli
+          Pop-Location
+
+          $resourceDir = Join-Path $repoRoot "src-tauri\resources\whisper"
+          New-Item -ItemType Directory -Force -Path $resourceDir | Out-Null
+          Copy-Item (Join-Path $workDir "models\ggml-tiny.en.bin") (Join-Path $resourceDir "ggml-tiny.en.bin") -Force
+
+          $cliCandidates = @(
+            (Join-Path $workDir "build\bin\Release\whisper-cli.exe"),
+            (Join-Path $workDir "build\bin\whisper-cli.exe")
+          )
+          $cliPath = $cliCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $cliPath) {
+            throw "whisper-cli.exe was not produced by the whisper.cpp build."
+          }
+          Copy-Item $cliPath (Join-Path $resourceDir "whisper-cli.exe") -Force
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:

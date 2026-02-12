@@ -56,6 +56,32 @@ The Rust backend manages pseudo-terminals and streams data to the frontend.
 - Window starts maximized and uses a custom (undecorated) title bar.
 - CSP is disabled in Tauri config for development.
 
+## Local speech-to-text (Whisper)
+
+Greepy supports local Whisper transcription without microphone capture:
+
+- Use **Menu -> Transcribe Audio File**
+- Select an audio file (`.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.webm`)
+- Transcript is inserted into the active terminal
+
+Requirements:
+
+- `whisper-cli` binary
+- A local Whisper model file (recommended for speed: `ggml-tiny.en.bin`)
+
+Environment variables:
+
+- `GREEPY_WHISPER_BIN` optional custom path to Whisper CLI binary
+- `GREEPY_WHISPER_MODEL_PATH` required path to local Whisper model
+- `GREEPY_WHISPER_LANGUAGE` optional language code (default: `en`)
+
+Bundled fallback:
+
+- If env vars are not set, the app also looks for bundled resources:
+  - `whisper/whisper-cli.exe`
+  - `whisper/ggml-tiny.en.bin`
+- GitHub release workflow populates these resources automatically before packaging.
+
 ## Auto updates (GitHub Releases)
 
 The app is configured to check:

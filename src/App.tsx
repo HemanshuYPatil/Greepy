@@ -81,7 +81,7 @@ type WorkspaceSetupForm = {
 };
 
 type WorkspaceSetupMode = "active-tab" | "new-tab";
-type SettingsSection = "appearance" | "controls" | "workspace" | "updates";
+type SettingsSection = "ui" | "appearance" | "controls" | "workspace" | "updates";
 type AppTheme =
   | "carbon-black"
   | "onyx-terminal"
@@ -97,12 +97,30 @@ type AppLayout =
   | "spacious"
   | "terminal-dense"
   | "focus-wide";
+type UiPreset =
+  | "default"
+  | "neon-grid"
+  | "ops-matrix"
+  | "ocean-glass"
+  | "ember-command";
 
 type AppearanceSettings = {
   appTheme: AppTheme;
   appLayout: AppLayout;
   activityMotion: "fast" | "balanced" | "slow";
   closeButtonMode: "hover" | "always";
+  uiPreset: UiPreset;
+};
+
+type UiPresetOption = {
+  id: UiPreset;
+  label: string;
+  description: string;
+  preview: string;
+  theme: AppTheme;
+  layout: AppLayout;
+  activityMotion: AppearanceSettings["activityMotion"];
+  closeButtonMode: AppearanceSettings["closeButtonMode"];
 };
 
 type WorkspacePreferences = {
@@ -113,6 +131,13 @@ type WorkspacePreferences = {
 type UpdaterSettings = {
   githubToken: string;
 };
+
+type SpeechCaptureState =
+  | "idle"
+  | "recording"
+  | "transcribing"
+  | "success"
+  | "error";
 
 const DEFAULT_SHORTCUTS: ShortcutSettings = {
   splitHorizontalKey: "d",
@@ -131,6 +156,8 @@ const LAST_PROJECT_KEY = "greepy.lastProject";
 const APPEARANCE_SETTINGS_KEY = "greepy.appearanceSettings";
 const WORKSPACE_PREFERENCES_KEY = "greepy.workspacePreferences";
 const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
+const SPEECH_SAMPLE_RATE = 16000;
+const SPEECH_MIC_CAPTURE_DISABLED = true;
 const DEFAULT_GRID_LAYOUT_ID = "grid-2x2";
 const GRID_LAYOUT_OPTIONS: GridLayoutOption[] = [
   { id: "grid-1", label: "1", rows: 1, cols: 1 },
@@ -154,6 +181,7 @@ const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
   appLayout: "clean",
   activityMotion: "fast",
   closeButtonMode: "hover",
+  uiPreset: "default",
 };
 
 const DEFAULT_WORKSPACE_PREFERENCES: WorkspacePreferences = {
@@ -170,6 +198,11 @@ const SETTINGS_SECTIONS: Array<{
   label: string;
   description: string;
 }> = [
+  {
+    id: "ui",
+    label: "UI",
+    description: "Switch complete app UI packs and layout direction.",
+  },
   {
     id: "appearance",
     label: "Appearance",
@@ -189,6 +222,59 @@ const SETTINGS_SECTIONS: Array<{
     id: "updates",
     label: "Updates",
     description: "Version status and release installation.",
+  },
+];
+
+const UI_PRESET_OPTIONS: UiPresetOption[] = [
+  {
+    id: "default",
+    label: "Default",
+    description: "Balanced everyday interface with the original shell look.",
+    preview: "Carbon Black + Clean layout + Fast motion",
+    theme: "carbon-black",
+    layout: "clean",
+    activityMotion: "fast",
+    closeButtonMode: "hover",
+  },
+  {
+    id: "neon-grid",
+    label: "Neon Grid",
+    description: "High-contrast futuristic dashboard with wide panel spacing.",
+    preview: "Neon Noir + Focus Wide + Balanced motion",
+    theme: "neon-noir",
+    layout: "focus-wide",
+    activityMotion: "balanced",
+    closeButtonMode: "always",
+  },
+  {
+    id: "ops-matrix",
+    label: "Ops Matrix",
+    description: "Dense operator view made for compact, high-volume terminals.",
+    preview: "Onyx Terminal + Terminal Dense + Fast motion",
+    theme: "onyx-terminal",
+    layout: "terminal-dense",
+    activityMotion: "fast",
+    closeButtonMode: "always",
+  },
+  {
+    id: "ocean-glass",
+    label: "Ocean Glass",
+    description: "Calmer interface with larger spacing and softer movement.",
+    preview: "Ocean Steel + Spacious + Slow motion",
+    theme: "ocean-steel",
+    layout: "spacious",
+    activityMotion: "slow",
+    closeButtonMode: "hover",
+  },
+  {
+    id: "ember-command",
+    label: "Ember Command",
+    description: "Warm tactical style with compact controls and bold accents.",
+    preview: "Ember Graphite + Compact + Balanced motion",
+    theme: "ember-graphite",
+    layout: "compact",
+    activityMotion: "balanced",
+    closeButtonMode: "hover",
   },
 ];
 
@@ -331,19 +417,6 @@ const saveLastProject = (path: string) => {
   window.localStorage.setItem(LAST_PROJECT_KEY, path);
 };
 
-const loadSession = (): SessionSnapshot | null => {
-  if (typeof window === "undefined") return null;
-  const raw = window.localStorage.getItem(SESSION_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as SessionSnapshot;
-    if (!parsed.projectPath || !parsed.panes?.length) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-};
-
 const saveSession = (snapshot: SessionSnapshot) => {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(SESSION_KEY, JSON.stringify(snapshot));
@@ -395,6 +468,83 @@ const hasBusySignalInChunk = (chunk: string) => {
   if (normalized.includes("esc to interrupt")) return true;
   if (AGENT_BUSY_TEXT_PATTERN.test(normalized)) return true;
   return chunk.includes("\r") && !chunk.includes("\n");
+};
+
+const mergeAudioChunks = (chunks: Float32Array[]) => {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(totalLength);
+  let nextOffset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, nextOffset);
+    nextOffset += chunk.length;
+  }
+  return merged;
+};
+
+const downsampleAudio = (
+  source: Float32Array,
+  sourceSampleRate: number,
+  targetSampleRate: number,
+) => {
+  if (sourceSampleRate === targetSampleRate) return source;
+  const ratio = sourceSampleRate / targetSampleRate;
+  const outputLength = Math.max(1, Math.round(source.length / ratio));
+  const output = new Float32Array(outputLength);
+  let sourceOffset = 0;
+
+  for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+    const nextSourceOffset = Math.min(
+      source.length,
+      Math.round((outputIndex + 1) * ratio),
+    );
+    let sum = 0;
+    let count = 0;
+    for (let sourceIndex = sourceOffset; sourceIndex < nextSourceOffset; sourceIndex += 1) {
+      sum += source[sourceIndex];
+      count += 1;
+    }
+    output[outputIndex] = count > 0 ? sum / count : 0;
+    sourceOffset = nextSourceOffset;
+  }
+
+  return output;
+};
+
+const encodeWave16BitPcm = (samples: Float32Array, sampleRate: number) => {
+  const bytesPerSample = 2;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let dataOffset = 44;
+  for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[sampleIndex]));
+    const encoded = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    view.setInt16(dataOffset, encoded, true);
+    dataOffset += bytesPerSample;
+  }
+
+  return new Uint8Array(buffer);
 };
 
 const loadShortcuts = (): ShortcutSettings => {
@@ -461,7 +611,15 @@ const loadAppearanceSettings = (): AppearanceSettings => {
       parsed.closeButtonMode === "always" || parsed.closeButtonMode === "hover"
         ? parsed.closeButtonMode
         : DEFAULT_APPEARANCE_SETTINGS.closeButtonMode;
-    return { appTheme, appLayout, activityMotion, closeButtonMode };
+    const uiPreset =
+      parsed.uiPreset === "default" ||
+      parsed.uiPreset === "neon-grid" ||
+      parsed.uiPreset === "ops-matrix" ||
+      parsed.uiPreset === "ocean-glass" ||
+      parsed.uiPreset === "ember-command"
+        ? parsed.uiPreset
+        : DEFAULT_APPEARANCE_SETTINGS.uiPreset;
+    return { appTheme, appLayout, activityMotion, closeButtonMode, uiPreset };
   } catch {
     return DEFAULT_APPEARANCE_SETTINGS;
   }
@@ -1285,10 +1443,23 @@ function MainApp() {
     shortcuts,
   );
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [speechCaptureState, setSpeechCaptureState] =
+    useState<SpeechCaptureState>("idle");
+  const [isSpeechCtrlHeld, setIsSpeechCtrlHeld] = useState(false);
   const [dropTargetPaneId, setDropTargetPaneId] = useState<string | null>(null);
   const [isImageDragActive, setIsImageDragActive] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const dropImageActiveRef = useRef(false);
+  const speechStreamRef = useRef<MediaStream | null>(null);
+  const speechAudioContextRef = useRef<AudioContext | null>(null);
+  const speechSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const speechProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const speechSilenceRef = useRef<GainNode | null>(null);
+  const speechChunksRef = useRef<Float32Array[]>([]);
+  const speechSampleRateRef = useRef(SPEECH_SAMPLE_RATE);
+  const speechRecordingRef = useRef(false);
+  const speechCtrlPressedRef = useRef(false);
+  const speechCtrlChordRef = useRef(false);
   const lastGlobalDropRef = useRef<{ paneId: string; payload: string; at: number } | null>(
     null,
   );
@@ -2071,6 +2242,264 @@ function MainApp() {
     await invoke("pty_write", { id: activeId, data: `${command}\r` });
   };
 
+  const handleTranscribeAudioFile = async () => {
+    if (!isProjectReady || !activeId) {
+      await message("Open a workspace first to insert transcript output.", {
+        title: "No Active Workspace",
+        kind: "info",
+      });
+      return;
+    }
+
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: "Select Audio File",
+      filters: [
+        {
+          name: "Audio",
+          extensions: ["wav", "mp3", "m4a", "flac", "ogg", "webm"],
+        },
+      ],
+    });
+    const selectedPath = typeof selected === "string" ? selected.trim() : "";
+    if (!selectedPath) return;
+
+    try {
+      const transcript = await invoke<string>("whisper_transcribe_local_file", {
+        audioPath: selectedPath,
+      });
+      const cleanedTranscript = transcript.trim();
+      if (!cleanedTranscript) {
+        await message("No speech text was detected in the selected file.", {
+          title: "No Transcript",
+          kind: "info",
+        });
+        return;
+      }
+      await invoke("pty_write", { id: activeId, data: cleanedTranscript });
+    } catch (error) {
+      await message(`Unable to transcribe the selected audio file.\n\n${formatErrorMessage(error)}`, {
+        title: "Transcription Error",
+        kind: "error",
+      });
+    }
+  };
+
+  const cleanupSpeechCaptureResources = async () => {
+    speechRecordingRef.current = false;
+    if (speechProcessorRef.current) {
+      speechProcessorRef.current.onaudioprocess = null;
+      speechProcessorRef.current.disconnect();
+      speechProcessorRef.current = null;
+    }
+    if (speechSourceRef.current) {
+      speechSourceRef.current.disconnect();
+      speechSourceRef.current = null;
+    }
+    if (speechSilenceRef.current) {
+      speechSilenceRef.current.disconnect();
+      speechSilenceRef.current = null;
+    }
+    if (speechStreamRef.current) {
+      speechStreamRef.current.getTracks().forEach((track) => track.stop());
+      speechStreamRef.current = null;
+    }
+    if (speechAudioContextRef.current) {
+      try {
+        await speechAudioContextRef.current.close();
+      } catch {
+        // Ignore audio context close errors.
+      }
+      speechAudioContextRef.current = null;
+    }
+  };
+
+  const resetSpeechOverlay = () => {
+    speechChunksRef.current = [];
+    setSpeechCaptureState("idle");
+  };
+
+  const handleCancelSpeechCapture = async () => {
+    await cleanupSpeechCaptureResources();
+    resetSpeechOverlay();
+  };
+
+  const handleStartSpeechCapture = async () => {
+    if (SPEECH_MIC_CAPTURE_DISABLED) {
+      setSpeechCaptureState("idle");
+      return;
+    }
+    if (speechCaptureState === "recording" || speechCaptureState === "transcribing") {
+      return;
+    }
+    if (!isProjectReady || !activeId) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const audioContext = new AudioContext();
+      await audioContext.resume();
+
+      const sourceNode = audioContext.createMediaStreamSource(stream);
+      const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+      const silenceNode = audioContext.createGain();
+      silenceNode.gain.value = 0;
+
+      speechChunksRef.current = [];
+      speechSampleRateRef.current = audioContext.sampleRate;
+      speechRecordingRef.current = true;
+      processorNode.onaudioprocess = (event) => {
+        if (!speechRecordingRef.current) return;
+        const channelData = event.inputBuffer.getChannelData(0);
+        speechChunksRef.current.push(new Float32Array(channelData));
+      };
+
+      sourceNode.connect(processorNode);
+      processorNode.connect(silenceNode);
+      silenceNode.connect(audioContext.destination);
+
+      speechStreamRef.current = stream;
+      speechAudioContextRef.current = audioContext;
+      speechSourceRef.current = sourceNode;
+      speechProcessorRef.current = processorNode;
+      speechSilenceRef.current = silenceNode;
+      setSpeechCaptureState("recording");
+    } catch (error) {
+      await cleanupSpeechCaptureResources();
+      setSpeechCaptureState("idle");
+    }
+  };
+
+  const handleStopSpeechCapture = async () => {
+    if (speechCaptureState !== "recording") return;
+    setSpeechCaptureState("transcribing");
+    speechRecordingRef.current = false;
+
+    await cleanupSpeechCaptureResources();
+
+    const mergedAudio = mergeAudioChunks(speechChunksRef.current);
+    speechChunksRef.current = [];
+    if (mergedAudio.length === 0) {
+      setSpeechCaptureState("idle");
+      return;
+    }
+
+    const downsampledAudio = downsampleAudio(
+      mergedAudio,
+      speechSampleRateRef.current,
+      SPEECH_SAMPLE_RATE,
+    );
+    const waveBytes = encodeWave16BitPcm(downsampledAudio, SPEECH_SAMPLE_RATE);
+
+    try {
+      const transcript = await invoke<string>("whisper_transcribe_local", {
+        audioBytes: Array.from(waveBytes),
+      });
+      const cleanedTranscript = transcript.trim();
+      if (!cleanedTranscript) {
+        throw new Error("No speech text detected.");
+      }
+
+      await invoke("pty_write", { id: activeId, data: cleanedTranscript });
+      setSpeechCaptureState("idle");
+    } catch (error) {
+      setSpeechCaptureState("idle");
+    }
+  };
+
+  useEffect(() => {
+    if (SPEECH_MIC_CAPTURE_DISABLED) return;
+
+    const handleSpeechKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Control") {
+        if (speechCtrlPressedRef.current) {
+          speechCtrlChordRef.current = true;
+          setIsSpeechCtrlHeld(false);
+          void handleCancelSpeechCapture();
+        }
+        return;
+      }
+      if (event.repeat || event.metaKey || event.altKey) return;
+      const targetElement = event.target as HTMLElement | null;
+      const isXtermHelperTextarea =
+        targetElement?.classList?.contains("xterm-helper-textarea") ?? false;
+      const isBlockedEditableTarget =
+        isEditableTarget(event.target) && !isXtermHelperTextarea;
+      if (isBlockedEditableTarget) return;
+      speechCtrlPressedRef.current = true;
+      speechCtrlChordRef.current = false;
+      setIsSpeechCtrlHeld(true);
+      if (speechCaptureState !== "recording" && speechCaptureState !== "transcribing") {
+        void handleStartSpeechCapture();
+      }
+    };
+
+    const handleSpeechKeyUp = (event: KeyboardEvent) => {
+      if (event.key !== "Control") return;
+      if (!speechCtrlPressedRef.current) return;
+
+      speechCtrlPressedRef.current = false;
+      setIsSpeechCtrlHeld(false);
+      const targetElement = event.target as HTMLElement | null;
+      const isXtermHelperTextarea =
+        targetElement?.classList?.contains("xterm-helper-textarea") ?? false;
+      const isBlockedEditableTarget =
+        isEditableTarget(event.target) && !isXtermHelperTextarea;
+      if (isBlockedEditableTarget || speechCtrlChordRef.current) {
+        speechCtrlChordRef.current = false;
+        void handleCancelSpeechCapture();
+        return;
+      }
+      speechCtrlChordRef.current = false;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (speechCaptureState === "recording") {
+        void handleStopSpeechCapture();
+      }
+    };
+
+    const resetSpeechCtrlState = () => {
+      speechCtrlPressedRef.current = false;
+      speechCtrlChordRef.current = false;
+      setIsSpeechCtrlHeld(false);
+      void handleCancelSpeechCapture();
+    };
+
+    window.addEventListener("keydown", handleSpeechKeyDown, true);
+    document.addEventListener("keydown", handleSpeechKeyDown, true);
+    window.addEventListener("keyup", handleSpeechKeyUp, true);
+    document.addEventListener("keyup", handleSpeechKeyUp, true);
+    window.addEventListener("blur", resetSpeechCtrlState);
+    return () => {
+      window.removeEventListener("keydown", handleSpeechKeyDown, true);
+      document.removeEventListener("keydown", handleSpeechKeyDown, true);
+      window.removeEventListener("keyup", handleSpeechKeyUp, true);
+      document.removeEventListener("keyup", handleSpeechKeyUp, true);
+      window.removeEventListener("blur", resetSpeechCtrlState);
+    };
+  }, [
+    speechCaptureState,
+    handleCancelSpeechCapture,
+    handleStartSpeechCapture,
+    handleStopSpeechCapture,
+  ]);
+
+  useEffect(
+    () => () => {
+      void cleanupSpeechCaptureResources();
+    },
+    [],
+  );
+
   const openSettings = (section: SettingsSection = "controls") => {
     setActiveSettingsSection(section);
     setIsSettingsOpen(true);
@@ -2095,6 +2524,18 @@ function MainApp() {
   ) => {
     setDraftShortcuts((current) => ({ ...current, imageDropFormat: value }));
     setShortcutError(null);
+  };
+
+  const handleSelectUiPreset = (presetId: UiPreset) => {
+    const preset = UI_PRESET_OPTIONS.find((option) => option.id === presetId);
+    if (!preset) return;
+    setDraftAppearanceSettings({
+      appTheme: preset.theme,
+      appLayout: preset.layout,
+      activityMotion: preset.activityMotion,
+      closeButtonMode: preset.closeButtonMode,
+      uiPreset: preset.id,
+    });
   };
 
   const handleSaveShortcuts = () => {
@@ -2354,6 +2795,15 @@ function MainApp() {
             setIsPaletteOpen(false);
           },
         },
+        {
+          id: "transcribe-audio-file",
+          label: "Transcribe audio file",
+          hint: "Local Whisper",
+          run: () => {
+            void handleTranscribeAudioFile();
+            setIsPaletteOpen(false);
+          },
+        },
       );
     }
 
@@ -2589,6 +3039,7 @@ function MainApp() {
 
   const appThemeClass = `theme-${appearanceSettings.appTheme}`;
   const appLayoutClass = `layout-${appearanceSettings.appLayout}`;
+  const uiPresetClass = `ui-${appearanceSettings.uiPreset}`;
   const activityMotionClass =
     appearanceSettings.activityMotion === "slow"
       ? "activity-slow"
@@ -2597,6 +3048,7 @@ function MainApp() {
         : "activity-fast";
   const closeModeClass =
     appearanceSettings.closeButtonMode === "always" ? "close-dot-always" : "";
+  const isSpeechOverlayVisible = !SPEECH_MIC_CAPTURE_DISABLED && isSpeechCtrlHeld;
 
   const handleWindowClose = () => {
     void appWindow.close();
@@ -2649,7 +3101,7 @@ function MainApp() {
   if (!isProjectReady) {
     return (
       <div
-        className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
+        className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${uiPresetClass} ${activityMotionClass} ${closeModeClass}`}
       >
         <header className="topbar startup-topbar">
           {windowControls}
@@ -2688,42 +3140,6 @@ function MainApp() {
                   {isCheckingForUpdates ? "Checking..." : "Install Update"}
                 </button>
               </div>
-            )}
-            {loadSession() && (
-              <button
-                className="btn secondary"
-                onClick={() => {
-                  const snapshot = loadSession();
-                  if (!snapshot) return;
-                  startupCommandExecuted.clear();
-                  setProjectPath(snapshot.projectPath);
-                  setWorkspaceName(
-                    snapshot.workspaceName?.trim() ||
-                      getFolderName(snapshot.projectPath) ||
-                      "Workspace",
-                  );
-                  setIsProjectReady(true);
-                  setPanes(
-                    snapshot.panes.map((pane, index) => ({
-                      id: pane.id,
-                      name: pane.name || `Terminal ${index + 1}`,
-                    })),
-                  );
-                  setActiveId(
-                    snapshot.panes.some((pane) => pane.id === snapshot.activeId)
-                      ? snapshot.activeId
-                      : snapshot.panes[0].id,
-                  );
-                  setLastSplit(snapshot.lastSplit ?? "horizontal");
-                  setFixedGridLayoutId(snapshot.gridLayoutId ?? null);
-                  setStartupCommands({});
-                  setIsMenuOpen(false);
-                  saveLastProject(snapshot.projectPath);
-                  updateRecentProjects(snapshot.projectPath);
-                }}
-              >
-                Resume last session
-              </button>
             )}
             {recentProjects.length > 0 && (
               <div className="recent-section">
@@ -2790,7 +3206,7 @@ function MainApp() {
 
   return (
     <div
-      className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${activityMotionClass} ${closeModeClass}`}
+      className={`app ${isFullscreen ? "fullscreen" : ""} ${appThemeClass} ${appLayoutClass} ${uiPresetClass} ${activityMotionClass} ${closeModeClass}`}
     >
       <header className="topbar">
         {windowControls}
@@ -2871,6 +3287,12 @@ function MainApp() {
               </button>
               <button
                 className="topbar-dropdown-item"
+                onClick={() => handleMenuAction(() => void handleTranscribeAudioFile())}
+              >
+                Transcribe Audio File
+              </button>
+              <button
+                className="topbar-dropdown-item"
                 onClick={() => handleMenuAction(() => void handleCheckForUpdates())}
                 disabled={isCheckingForUpdates}
               >
@@ -2946,6 +3368,22 @@ function MainApp() {
         })}
       </div>
 
+      {isSpeechOverlayVisible && (
+        <div className={`speech-overlay speech-${speechCaptureState}`}>
+          <div className="speech-wave" aria-hidden>
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </div>
+        </div>
+      )}
+
       {workspaceSetupModal}
 
       {isSettingsOpen && (
@@ -2980,6 +3418,42 @@ function MainApp() {
                 ))}
               </aside>
               <section className="settings-panel">
+                {activeSettingsSection === "ui" && (
+                  <div className="settings-section">
+                    <div className="settings-section-title">UI Presets</div>
+                    <div className="settings-section-subtitle">
+                      Choose a full app UI pack. Each preset updates theme, layout, and
+                      interaction behavior together.
+                    </div>
+                    <div className="ui-preset-grid">
+                      {UI_PRESET_OPTIONS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          className={`ui-preset-card ${
+                            draftAppearanceSettings.uiPreset === preset.id ? "active" : ""
+                          }`}
+                          onClick={() => handleSelectUiPreset(preset.id)}
+                        >
+                          <span className="ui-preset-label">
+                            {preset.label}
+                            {preset.id === "default" ? " (Default)" : ""}
+                          </span>
+                          <span className="ui-preset-description">{preset.description}</span>
+                          <span className="ui-preset-preview">{preset.preview}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="settings-card">
+                      <div className="settings-card-title">Current selection</div>
+                      <div className="settings-card-text">
+                        {UI_PRESET_OPTIONS.find(
+                          (preset) => preset.id === draftAppearanceSettings.uiPreset,
+                        )?.label ?? "Default"}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {activeSettingsSection === "appearance" && (
                   <div className="settings-section">
                     <div className="settings-section-title">Appearance</div>
@@ -3127,6 +3601,10 @@ function MainApp() {
                     <div className="field-hint">
                       Multiple dropped images can be inserted in one line or one path per line.
                     </div>
+                    <div className="field-hint">
+                      Speech-to-text microphone capture is disabled. Use Menu to
+                      Transcribe Audio File to run local Whisper without mic access.
+                    </div>
                     {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
                     draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (
                       <div className="field-hint">
@@ -3214,6 +3692,11 @@ function MainApp() {
               {activeSettingsSection === "appearance" && (
                 <button className="btn primary" onClick={handleSaveAppearance}>
                   Save Appearance
+                </button>
+              )}
+              {activeSettingsSection === "ui" && (
+                <button className="btn primary" onClick={handleSaveAppearance}>
+                  Save UI
                 </button>
               )}
               {activeSettingsSection === "workspace" && (
