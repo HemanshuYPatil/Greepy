@@ -157,7 +157,7 @@ const APPEARANCE_SETTINGS_KEY = "greepy.appearanceSettings";
 const WORKSPACE_PREFERENCES_KEY = "greepy.workspacePreferences";
 const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
 const SPEECH_SAMPLE_RATE = 16000;
-const SPEECH_MIC_CAPTURE_DISABLED = true;
+const SPEECH_MIC_CAPTURE_DISABLED = false;
 const DEFAULT_GRID_LAYOUT_ID = "grid-2x2";
 const GRID_LAYOUT_OPTIONS: GridLayoutOption[] = [
   { id: "grid-1", label: "1", rows: 1, cols: 1 },
@@ -3602,8 +3602,8 @@ function MainApp() {
                       Multiple dropped images can be inserted in one line or one path per line.
                     </div>
                     <div className="field-hint">
-                      Speech-to-text microphone capture is disabled. Use Menu to
-                      Transcribe Audio File to run local Whisper without mic access.
+                      Speech-to-text: hold Ctrl to record and release to transcribe into the
+                      active terminal. You can also use Menu and choose Transcribe Audio File.
                     </div>
                     {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
                     draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (
