@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, confirm, message } from "@tauri-apps/plugin-dialog";
@@ -158,6 +158,9 @@ const WORKSPACE_PREFERENCES_KEY = "greepy.workspacePreferences";
 const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
 const SPEECH_SAMPLE_RATE = 16000;
 const SPEECH_MIC_CAPTURE_DISABLED = false;
+const SPEECH_WAVE_BAR_COUNT = 9;
+const SPEECH_WAVE_IDLE_LEVEL = 0.08;
+const SPEECH_WAVE_ACTIVE_FLOOR = 0.12;
 const DEFAULT_GRID_LAYOUT_ID = "grid-2x2";
 const GRID_LAYOUT_OPTIONS: GridLayoutOption[] = [
   { id: "grid-1", label: "1", rows: 1, cols: 1 },
@@ -545,6 +548,38 @@ const encodeWave16BitPcm = (samples: Float32Array, sampleRate: number) => {
   }
 
   return new Uint8Array(buffer);
+};
+
+const createSpeechWaveLevels = (value = SPEECH_WAVE_IDLE_LEVEL) =>
+  Array.from({ length: SPEECH_WAVE_BAR_COUNT }, () => value);
+
+const computeSpeechWaveLevels = (samples: Float32Array) => {
+  if (samples.length === 0) return createSpeechWaveLevels();
+  const levels = createSpeechWaveLevels();
+  const segmentSize = Math.max(1, Math.floor(samples.length / SPEECH_WAVE_BAR_COUNT));
+
+  for (let index = 0; index < SPEECH_WAVE_BAR_COUNT; index += 1) {
+    const segmentStart = index * segmentSize;
+    const segmentEnd =
+      index === SPEECH_WAVE_BAR_COUNT - 1
+        ? samples.length
+        : Math.min(samples.length, segmentStart + segmentSize);
+    if (segmentStart >= samples.length || segmentEnd <= segmentStart) {
+      levels[index] = SPEECH_WAVE_IDLE_LEVEL;
+      continue;
+    }
+
+    let energy = 0;
+    for (let sampleIndex = segmentStart; sampleIndex < segmentEnd; sampleIndex += 1) {
+      const sample = samples[sampleIndex];
+      energy += sample * sample;
+    }
+    const rms = Math.sqrt(energy / (segmentEnd - segmentStart));
+    const normalized = Math.min(1, rms * 10);
+    levels[index] = Math.max(SPEECH_WAVE_ACTIVE_FLOOR, normalized);
+  }
+
+  return levels;
 };
 
 const loadShortcuts = (): ShortcutSettings => {
@@ -1446,6 +1481,9 @@ function MainApp() {
   const [speechCaptureState, setSpeechCaptureState] =
     useState<SpeechCaptureState>("idle");
   const [isSpeechCtrlHeld, setIsSpeechCtrlHeld] = useState(false);
+  const [speechWaveLevels, setSpeechWaveLevels] = useState<number[]>(() =>
+    createSpeechWaveLevels(),
+  );
   const [dropTargetPaneId, setDropTargetPaneId] = useState<string | null>(null);
   const [isImageDragActive, setIsImageDragActive] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -1460,6 +1498,8 @@ function MainApp() {
   const speechRecordingRef = useRef(false);
   const speechCtrlPressedRef = useRef(false);
   const speechCtrlChordRef = useRef(false);
+  const speechStartInFlightRef = useRef(false);
+  const speechStartTokenRef = useRef(0);
   const lastGlobalDropRef = useRef<{ paneId: string; payload: string; at: number } | null>(
     null,
   );
@@ -2286,7 +2326,7 @@ function MainApp() {
     }
   };
 
-  const cleanupSpeechCaptureResources = async () => {
+  const cleanupSpeechCaptureResources = useCallback(async () => {
     speechRecordingRef.current = false;
     if (speechProcessorRef.current) {
       speechProcessorRef.current.onaudioprocess = null;
@@ -2313,19 +2353,22 @@ function MainApp() {
       }
       speechAudioContextRef.current = null;
     }
-  };
+  }, []);
 
-  const resetSpeechOverlay = () => {
+  const resetSpeechOverlay = useCallback(() => {
     speechChunksRef.current = [];
+    setSpeechWaveLevels(createSpeechWaveLevels());
     setSpeechCaptureState("idle");
-  };
+  }, []);
 
-  const handleCancelSpeechCapture = async () => {
+  const handleCancelSpeechCapture = useCallback(async () => {
+    speechStartTokenRef.current += 1;
+    speechStartInFlightRef.current = false;
     await cleanupSpeechCaptureResources();
     resetSpeechOverlay();
-  };
+  }, [cleanupSpeechCaptureResources, resetSpeechOverlay]);
 
-  const handleStartSpeechCapture = async () => {
+  const handleStartSpeechCapture = useCallback(async () => {
     if (SPEECH_MIC_CAPTURE_DISABLED) {
       setSpeechCaptureState("idle");
       return;
@@ -2333,10 +2376,17 @@ function MainApp() {
     if (speechCaptureState === "recording" || speechCaptureState === "transcribing") {
       return;
     }
+    if (speechStartInFlightRef.current || speechRecordingRef.current) return;
     if (!isProjectReady || !activeId) return;
 
+    speechStartInFlightRef.current = true;
+    const startToken = speechStartTokenRef.current + 1;
+    speechStartTokenRef.current = startToken;
+    let stream: MediaStream | null = null;
+    let audioContext: AudioContext | null = null;
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           echoCancellation: true,
@@ -2344,8 +2394,11 @@ function MainApp() {
           autoGainControl: true,
         },
       });
-      const audioContext = new AudioContext();
+      audioContext = new AudioContext();
       await audioContext.resume();
+      if (!speechCtrlPressedRef.current || speechStartTokenRef.current !== startToken) {
+        return;
+      }
 
       const sourceNode = audioContext.createMediaStreamSource(stream);
       const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
@@ -2359,6 +2412,14 @@ function MainApp() {
         if (!speechRecordingRef.current) return;
         const channelData = event.inputBuffer.getChannelData(0);
         speechChunksRef.current.push(new Float32Array(channelData));
+        const nextLevels = computeSpeechWaveLevels(channelData);
+        setSpeechWaveLevels((current) =>
+          current.map((value, index) => {
+            const nextValue = nextLevels[index] ?? SPEECH_WAVE_IDLE_LEVEL;
+            const decayed = Math.max(SPEECH_WAVE_IDLE_LEVEL, value * 0.74);
+            return Math.max(nextValue, decayed);
+          }),
+        );
       };
 
       sourceNode.connect(processorNode);
@@ -2366,27 +2427,45 @@ function MainApp() {
       silenceNode.connect(audioContext.destination);
 
       speechStreamRef.current = stream;
+      stream = null;
       speechAudioContextRef.current = audioContext;
+      audioContext = null;
       speechSourceRef.current = sourceNode;
       speechProcessorRef.current = processorNode;
       speechSilenceRef.current = silenceNode;
       setSpeechCaptureState("recording");
-    } catch (error) {
+    } catch {
       await cleanupSpeechCaptureResources();
+      setSpeechWaveLevels(createSpeechWaveLevels());
       setSpeechCaptureState("idle");
+    } finally {
+      speechStartInFlightRef.current = false;
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      if (audioContext) {
+        try {
+          await audioContext.close();
+        } catch {
+          // Ignore audio context close errors.
+        }
+      }
     }
-  };
+  }, [activeId, cleanupSpeechCaptureResources, isProjectReady, speechCaptureState]);
 
-  const handleStopSpeechCapture = async () => {
+  const handleStopSpeechCapture = useCallback(async () => {
     if (speechCaptureState !== "recording") return;
     setSpeechCaptureState("transcribing");
     speechRecordingRef.current = false;
+    speechStartTokenRef.current += 1;
+    speechStartInFlightRef.current = false;
 
     await cleanupSpeechCaptureResources();
 
     const mergedAudio = mergeAudioChunks(speechChunksRef.current);
     speechChunksRef.current = [];
     if (mergedAudio.length === 0) {
+      setSpeechWaveLevels(createSpeechWaveLevels());
       setSpeechCaptureState("idle");
       return;
     }
@@ -2408,11 +2487,12 @@ function MainApp() {
       }
 
       await invoke("pty_write", { id: activeId, data: cleanedTranscript });
-      setSpeechCaptureState("idle");
-    } catch (error) {
-      setSpeechCaptureState("idle");
+    } catch {
+      // Ignore speech transcription failures for hold-to-transcribe.
     }
-  };
+    setSpeechWaveLevels(createSpeechWaveLevels());
+    setSpeechCaptureState("idle");
+  }, [activeId, cleanupSpeechCaptureResources, speechCaptureState]);
 
   useEffect(() => {
     if (SPEECH_MIC_CAPTURE_DISABLED) return;
@@ -2464,7 +2544,9 @@ function MainApp() {
 
       if (speechCaptureState === "recording") {
         void handleStopSpeechCapture();
+        return;
       }
+      void handleCancelSpeechCapture();
     };
 
     const resetSpeechCtrlState = () => {
@@ -2475,15 +2557,11 @@ function MainApp() {
     };
 
     window.addEventListener("keydown", handleSpeechKeyDown, true);
-    document.addEventListener("keydown", handleSpeechKeyDown, true);
     window.addEventListener("keyup", handleSpeechKeyUp, true);
-    document.addEventListener("keyup", handleSpeechKeyUp, true);
     window.addEventListener("blur", resetSpeechCtrlState);
     return () => {
       window.removeEventListener("keydown", handleSpeechKeyDown, true);
-      document.removeEventListener("keydown", handleSpeechKeyDown, true);
       window.removeEventListener("keyup", handleSpeechKeyUp, true);
-      document.removeEventListener("keyup", handleSpeechKeyUp, true);
       window.removeEventListener("blur", resetSpeechCtrlState);
     };
   }, [
@@ -3371,15 +3449,16 @@ function MainApp() {
       {isSpeechOverlayVisible && (
         <div className={`speech-overlay speech-${speechCaptureState}`}>
           <div className="speech-wave" aria-hidden>
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
+            {speechWaveLevels.map((level, index) => (
+              <span
+                // Index is stable because the bar count is fixed.
+                key={index}
+                style={{
+                  height: `${Math.round(2 + level * 7)}px`,
+                  opacity: 0.46 + level * 0.54,
+                }}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -3792,3 +3871,4 @@ function App() {
 }
 
 export default App;
+

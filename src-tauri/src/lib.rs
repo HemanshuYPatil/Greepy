@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
@@ -171,6 +172,58 @@ fn resolve_bundled_resource(app: &tauri::AppHandle, relative_path: &str) -> Opti
         .map(|resolved_path| resolved_path.to_string_lossy().to_string())
 }
 
+fn find_file_recursively(root: &Path, file_name: &str) -> Option<PathBuf> {
+    if !root.exists() {
+        return None;
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+
+            let matches_name = path
+                .file_name()
+                .and_then(|candidate| candidate.to_str())
+                .map(|candidate| candidate.eq_ignore_ascii_case(file_name))
+                .unwrap_or(false);
+            if matches_name {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_bundled_resource_candidates(
+    app: &tauri::AppHandle,
+    relative_paths: &[&str],
+    file_names: &[&str],
+) -> Option<String> {
+    for relative_path in relative_paths {
+        if let Some(path) = resolve_bundled_resource(app, relative_path) {
+            return Some(path);
+        }
+    }
+
+    let resource_dir = app.path().resource_dir().ok()?;
+    for file_name in file_names {
+        if let Some(found_path) = find_file_recursively(&resource_dir, file_name) {
+            return Some(found_path.to_string_lossy().to_string());
+        }
+    }
+
+    None
+}
+
 fn whisper_transcribe_local_impl(
     app: &tauri::AppHandle,
     audio_bytes: Vec<u8>,
@@ -184,14 +237,34 @@ fn whisper_transcribe_local_impl(
 
     let resolved_binary = resolve_non_empty(whisper_binary)
         .or_else(|| resolve_non_empty(std::env::var("GREEPY_WHISPER_BIN").ok()))
-        .or_else(|| resolve_bundled_resource(app, "whisper/whisper-cli.exe"))
-        .or_else(|| resolve_bundled_resource(app, "whisper/whisper-cli"))
+        .or_else(|| {
+            resolve_bundled_resource_candidates(
+                app,
+                &[
+                    "whisper/whisper-cli.exe",
+                    "resources/whisper/whisper-cli.exe",
+                    "whisper/whisper-cli",
+                    "resources/whisper/whisper-cli",
+                ],
+                &["whisper-cli.exe", "whisper-cli"],
+            )
+        })
         .unwrap_or_else(|| "whisper-cli".to_string());
 
     let resolved_model_path = resolve_non_empty(model_path)
         .or_else(|| resolve_non_empty(std::env::var("GREEPY_WHISPER_MODEL_PATH").ok()))
-        .or_else(|| resolve_bundled_resource(app, "whisper/ggml-tiny.en.bin"))
-        .or_else(|| resolve_bundled_resource(app, "whisper/ggml-base.en.bin"))
+        .or_else(|| {
+            resolve_bundled_resource_candidates(
+                app,
+                &[
+                    "whisper/ggml-tiny.en.bin",
+                    "resources/whisper/ggml-tiny.en.bin",
+                    "whisper/ggml-base.en.bin",
+                    "resources/whisper/ggml-base.en.bin",
+                ],
+                &["ggml-tiny.en.bin", "ggml-base.en.bin"],
+            )
+        })
         .ok_or_else(|| {
             "Whisper model path is missing. Set GREEPY_WHISPER_MODEL_PATH, pass modelPath, or bundle whisper/ggml-tiny.en.bin in app resources.".to_string()
         })?;
