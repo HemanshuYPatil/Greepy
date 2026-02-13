@@ -58,6 +58,8 @@ The Rust backend manages pseudo-terminals and streams data to the frontend.
 
 ## Local speech-to-text (Whisper)
 
+Speech-to-text is currently disabled in this build.
+
 Greepy supports local Whisper transcription without microphone capture:
 
 - Use **Menu -> Transcribe Audio File**

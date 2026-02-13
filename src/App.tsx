@@ -159,7 +159,8 @@ const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
 const WHISPER_MODEL_PATH_KEY = "greepy.whisperModelPath";
 const WHISPER_BINARY_PATH_KEY = "greepy.whisperBinaryPath";
 const SPEECH_SAMPLE_RATE = 16000;
-const SPEECH_MIC_CAPTURE_DISABLED = false;
+const SPEECH_TO_TEXT_DISABLED = true;
+const SPEECH_MIC_CAPTURE_DISABLED = SPEECH_TO_TEXT_DISABLED;
 const SPEECH_WAVE_BAR_COUNT = 9;
 const SPEECH_WAVE_IDLE_LEVEL = 0.08;
 const SPEECH_WAVE_ACTIVE_FLOOR = 0.12;
@@ -2385,6 +2386,13 @@ function MainApp() {
   );
 
   const handleTranscribeAudioFile = async () => {
+    if (SPEECH_TO_TEXT_DISABLED) {
+      await message("Speech-to-text is currently disabled in this build.", {
+        title: "Speech-to-Text Disabled",
+        kind: "info",
+      });
+      return;
+    }
     if (!isProjectReady || !activeId) {
       await message("Open a workspace first to insert transcript output.", {
         title: "No Active Workspace",
@@ -3501,12 +3509,14 @@ function MainApp() {
               >
                 Servers
               </button>
-              <button
-                className="topbar-dropdown-item"
-                onClick={() => handleMenuAction(() => void handleTranscribeAudioFile())}
-              >
-                Transcribe Audio File
-              </button>
+              {!SPEECH_TO_TEXT_DISABLED && (
+                <button
+                  className="topbar-dropdown-item"
+                  onClick={() => handleMenuAction(() => void handleTranscribeAudioFile())}
+                >
+                  Transcribe Audio File
+                </button>
+              )}
               <button
                 className="topbar-dropdown-item"
                 onClick={() => handleMenuAction(() => void handleCheckForUpdates())}
@@ -3819,9 +3829,7 @@ function MainApp() {
                       Multiple dropped images can be inserted in one line or one path per line.
                     </div>
                     <div className="field-hint">
-                      {SPEECH_MIC_CAPTURE_DISABLED
-                        ? "Speech-to-text uses local Whisper from Menu -> Transcribe Audio File."
-                        : "Speech-to-text: hold Ctrl to record and release to transcribe into the active terminal. You can also use Menu and choose Transcribe Audio File."}
+                      Speech-to-text is currently disabled.
                     </div>
                     {draftShortcuts.splitHorizontalKey.toLowerCase() === "v" ||
                     draftShortcuts.splitVerticalKey.toLowerCase() === "v" ? (

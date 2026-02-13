@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
+const SPEECH_TO_TEXT_DISABLED: bool = true;
+
 struct Session {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -612,6 +614,9 @@ fn whisper_transcribe_local(
     model_path: Option<String>,
     language: Option<String>,
 ) -> Result<String, String> {
+    if SPEECH_TO_TEXT_DISABLED {
+        return Err("Speech-to-text is disabled in this build.".to_string());
+    }
     whisper_transcribe_local_impl(&app, audio_bytes, whisper_binary, model_path, language)
 }
 
@@ -623,6 +628,9 @@ fn whisper_transcribe_local_file(
     model_path: Option<String>,
     language: Option<String>,
 ) -> Result<String, String> {
+    if SPEECH_TO_TEXT_DISABLED {
+        return Err("Speech-to-text is disabled in this build.".to_string());
+    }
     let trimmed_audio_path = audio_path.trim();
     if trimmed_audio_path.is_empty() {
         return Err("Audio file path is missing.".to_string());
