@@ -156,8 +156,10 @@ const LAST_PROJECT_KEY = "greepy.lastProject";
 const APPEARANCE_SETTINGS_KEY = "greepy.appearanceSettings";
 const WORKSPACE_PREFERENCES_KEY = "greepy.workspacePreferences";
 const UPDATER_SETTINGS_KEY = "greepy.updaterSettings";
+const WHISPER_MODEL_PATH_KEY = "greepy.whisperModelPath";
+const WHISPER_BINARY_PATH_KEY = "greepy.whisperBinaryPath";
 const SPEECH_SAMPLE_RATE = 16000;
-const SPEECH_MIC_CAPTURE_DISABLED = true;
+const SPEECH_MIC_CAPTURE_DISABLED = false;
 const SPEECH_WAVE_BAR_COUNT = 9;
 const SPEECH_WAVE_IDLE_LEVEL = 0.08;
 const SPEECH_WAVE_ACTIVE_FLOOR = 0.12;
@@ -711,6 +713,29 @@ const loadUpdaterSettings = (): UpdaterSettings => {
     return DEFAULT_UPDATER_SETTINGS;
   }
 };
+
+const loadStoredWhisperPath = (key: string): string => {
+  if (typeof window === "undefined") return "";
+  try {
+    const value = window.localStorage.getItem(key);
+    return typeof value === "string" ? value.trim() : "";
+  } catch {
+    return "";
+  }
+};
+
+const saveStoredWhisperPath = (key: string, value: string) => {
+  if (typeof window === "undefined") return;
+  const trimmed = value.trim();
+  if (!trimmed) {
+    window.localStorage.removeItem(key);
+    return;
+  }
+  window.localStorage.setItem(key, trimmed);
+};
+
+const formatErrorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
 
 let ptyCreateQueue: Promise<void> = Promise.resolve();
 const startupCommandExecuted = new Set<string>();
@@ -1488,6 +1513,8 @@ function MainApp() {
   const [isImageDragActive, setIsImageDragActive] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const dropImageActiveRef = useRef(false);
+  const whisperModelPathRef = useRef(loadStoredWhisperPath(WHISPER_MODEL_PATH_KEY));
+  const whisperBinaryPathRef = useRef(loadStoredWhisperPath(WHISPER_BINARY_PATH_KEY));
   const speechStreamRef = useRef<MediaStream | null>(null);
   const speechAudioContextRef = useRef<AudioContext | null>(null);
   const speechSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -2282,6 +2309,74 @@ function MainApp() {
     await invoke("pty_write", { id: activeId, data: `${command}\r` });
   };
 
+  const buildWhisperOptions = useCallback(() => {
+    const options: {
+      modelPath?: string;
+      whisperBinary?: string;
+    } = {};
+    const modelPath = whisperModelPathRef.current.trim();
+    const whisperBinary = whisperBinaryPathRef.current.trim();
+    if (modelPath) options.modelPath = modelPath;
+    if (whisperBinary) options.whisperBinary = whisperBinary;
+    return options;
+  }, []);
+
+  const tryResolveWhisperRequirements = useCallback(async (errorMessage: string) => {
+    let updated = false;
+    const missingModel = errorMessage.includes("Whisper model path is missing");
+    const missingBinary = errorMessage.includes("Failed to launch whisper binary");
+
+    if (missingModel) {
+      const selectedModel = await open({
+        directory: false,
+        multiple: false,
+        title: "Select Whisper Model (.bin)",
+        filters: [{ name: "Whisper Model", extensions: ["bin"] }],
+      });
+      const selectedModelPath =
+        typeof selectedModel === "string" ? selectedModel.trim() : "";
+      if (selectedModelPath) {
+        whisperModelPathRef.current = selectedModelPath;
+        saveStoredWhisperPath(WHISPER_MODEL_PATH_KEY, selectedModelPath);
+        updated = true;
+      }
+    }
+
+    if (missingBinary) {
+      const selectedBinary = await open({
+        directory: false,
+        multiple: false,
+        title: "Select Whisper CLI binary",
+      });
+      const selectedBinaryPath =
+        typeof selectedBinary === "string" ? selectedBinary.trim() : "";
+      if (selectedBinaryPath) {
+        whisperBinaryPathRef.current = selectedBinaryPath;
+        saveStoredWhisperPath(WHISPER_BINARY_PATH_KEY, selectedBinaryPath);
+        updated = true;
+      }
+    }
+
+    return updated;
+  }, []);
+
+  const transcribeWithRecovery = useCallback(
+    async (runTranscription: () => Promise<string>) => {
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await runTranscription();
+        } catch (error) {
+          lastError = error;
+          const resolved = await tryResolveWhisperRequirements(formatErrorMessage(error));
+          if (!resolved) break;
+        }
+      }
+      throw lastError ?? new Error("Whisper transcription failed.");
+    },
+    [tryResolveWhisperRequirements],
+  );
+
   const handleTranscribeAudioFile = async () => {
     if (!isProjectReady || !activeId) {
       await message("Open a workspace first to insert transcript output.", {
@@ -2306,9 +2401,12 @@ function MainApp() {
     if (!selectedPath) return;
 
     try {
-      const transcript = await invoke<string>("whisper_transcribe_local_file", {
-        audioPath: selectedPath,
-      });
+      const transcript = await transcribeWithRecovery(() =>
+        invoke<string>("whisper_transcribe_local_file", {
+          audioPath: selectedPath,
+          ...buildWhisperOptions(),
+        }),
+      );
       const cleanedTranscript = transcript.trim();
       if (!cleanedTranscript) {
         await message("No speech text was detected in the selected file.", {
@@ -2478,21 +2576,33 @@ function MainApp() {
     const waveBytes = encodeWave16BitPcm(downsampledAudio, SPEECH_SAMPLE_RATE);
 
     try {
-      const transcript = await invoke<string>("whisper_transcribe_local", {
-        audioBytes: Array.from(waveBytes),
-      });
+      const transcript = await transcribeWithRecovery(() =>
+        invoke<string>("whisper_transcribe_local", {
+          audioBytes: Array.from(waveBytes),
+          ...buildWhisperOptions(),
+        }),
+      );
       const cleanedTranscript = transcript.trim();
       if (!cleanedTranscript) {
         throw new Error("No speech text detected.");
       }
 
       await invoke("pty_write", { id: activeId, data: cleanedTranscript });
-    } catch {
-      // Ignore speech transcription failures for hold-to-transcribe.
+    } catch (error) {
+      await message(`Unable to transcribe microphone audio.\n\n${formatErrorMessage(error)}`, {
+        title: "Transcription Error",
+        kind: "error",
+      });
     }
     setSpeechWaveLevels(createSpeechWaveLevels());
     setSpeechCaptureState("idle");
-  }, [activeId, cleanupSpeechCaptureResources, speechCaptureState]);
+  }, [
+    activeId,
+    buildWhisperOptions,
+    cleanupSpeechCaptureResources,
+    speechCaptureState,
+    transcribeWithRecovery,
+  ]);
 
   useEffect(() => {
     if (SPEECH_MIC_CAPTURE_DISABLED) return;
@@ -2706,9 +2816,6 @@ function MainApp() {
       setIsServersInline(true);
     }
   };
-
-  const formatErrorMessage = (error: unknown) =>
-    error instanceof Error ? error.message : String(error);
 
   const handleCheckForUpdates = async (silent = false) => {
     if (isCheckingForUpdates) return;
