@@ -55,27 +55,12 @@ jobs:
 
           git clone --depth 1 https://github.com/ggml-org/whisper.cpp $workDir
           Push-Location $workDir
-          $modelPath = Join-Path $workDir "models\ggml-tiny.en.bin"
-          $downloadScript = Join-Path $workDir "models\download-ggml-model.cmd"
-          if (Test-Path $downloadScript) {
-            & $downloadScript tiny.en
-          }
-          if (-not (Test-Path $modelPath)) {
-            Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin?download=true" -OutFile $modelPath
-          }
-          if (-not (Test-Path $modelPath)) {
-            throw "Failed to fetch ggml-tiny.en.bin for release packaging."
-          }
-          if ((Get-Item $modelPath).Length -lt 1000000) {
-            throw "Downloaded ggml-tiny.en.bin appears invalid (too small)."
-          }
           cmake -S . -B build -A x64
           cmake --build build --config Release --target whisper-cli
           Pop-Location
 
           $resourceDir = Join-Path $repoRoot "src-tauri\resources\whisper"
           New-Item -ItemType Directory -Force -Path $resourceDir | Out-Null
-          Copy-Item $modelPath (Join-Path $resourceDir "ggml-tiny.en.bin") -Force
 
           $cliCandidates = @(
             (Join-Path $workDir "build\bin\Release\whisper-cli.exe"),

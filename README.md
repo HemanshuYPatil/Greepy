@@ -67,21 +67,21 @@ Greepy supports local Whisper transcription without microphone capture:
 Requirements:
 
 - `whisper-cli` binary
-- A local Whisper model file (recommended for speed: `ggml-tiny.en.bin`)
+- A local Whisper model file (recommended for quality: `ggml-large-v3.bin`)
 - On Windows, keep Whisper runtime DLLs next to `whisper-cli.exe` when using dynamic builds (for example: `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`)
 
 Environment variables:
 
 - `GREEPY_WHISPER_BIN` optional custom path to Whisper CLI binary
 - `GREEPY_WHISPER_MODEL_PATH` required path to local Whisper model
-- `GREEPY_WHISPER_LANGUAGE` optional language code (default: `en`)
+- `GREEPY_WHISPER_LANGUAGE` optional language code (default: `auto`)
 
 Bundled fallback:
 
-- If env vars are not set, the app also looks for bundled resources:
+- If env vars are not set, the app also looks for bundled Whisper binaries:
   - `whisper/whisper-cli.exe`
-  - `whisper/ggml-tiny.en.bin`
-- GitHub release workflow populates these resources automatically before packaging.
+- Tiny models are disabled; provide a larger local model such as `ggml-large-v3.bin`.
+- GitHub release workflow populates `whisper-cli.exe` (and its runtime DLLs) before packaging.
 
 ## Auto updates (GitHub Releases)
 

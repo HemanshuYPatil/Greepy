@@ -291,6 +291,26 @@ fn find_whisper_model_recursively(root: &Path) -> Option<PathBuf> {
         return None;
     }
 
+    fn model_priority(file_name: &str) -> usize {
+        match file_name {
+            "ggml-large-v3.bin" => 0,
+            "ggml-large-v3-turbo.bin" => 1,
+            "ggml-large-v2.bin" => 2,
+            "ggml-large-v1.bin" => 3,
+            "ggml-large.bin" => 4,
+            "ggml-medium.bin" => 5,
+            "ggml-medium.en.bin" => 6,
+            "ggml-small.bin" => 7,
+            "ggml-small.en.bin" => 8,
+            "ggml-base.bin" => 9,
+            "ggml-base.en.bin" => 10,
+            "ggml-tiny.bin" => 11,
+            "ggml-tiny.en.bin" => 12,
+            _ => 100,
+        }
+    }
+
+    let mut best_match: Option<(usize, u64, PathBuf)> = None;
     let mut pending = vec![root.to_path_buf()];
     while let Some(current) = pending.pop() {
         let Ok(entries) = fs::read_dir(&current) else {
@@ -312,12 +332,30 @@ fn find_whisper_model_recursively(root: &Path) -> Option<PathBuf> {
                 })
                 .unwrap_or(false);
             if is_ggml_model {
-                return Some(path);
+                let model_name = path
+                    .file_name()
+                    .and_then(|candidate| candidate.to_str())
+                    .map(|candidate| candidate.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let priority = model_priority(&model_name);
+                let size = fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let should_replace = best_match
+                    .as_ref()
+                    .map(|(best_priority, best_size, _)| {
+                        priority < *best_priority
+                            || (priority == *best_priority && size > *best_size)
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    best_match = Some((priority, size, path));
+                }
             }
         }
     }
 
-    None
+    best_match.map(|(_, _, path)| path)
 }
 
 fn resolve_bundled_resource_candidates(
@@ -375,6 +413,14 @@ fn whisper_runtime_hint(status_code: Option<i32>) -> Option<&'static str> {
     None
 }
 
+fn is_tiny_whisper_model_path(model_path: &str) -> bool {
+    Path::new(model_path)
+        .file_name()
+        .and_then(|candidate| candidate.to_str())
+        .map(|candidate| candidate.to_ascii_lowercase().contains("ggml-tiny"))
+        .unwrap_or(false)
+}
+
 fn whisper_transcribe_local_impl(
     app: &tauri::AppHandle,
     audio_bytes: Vec<u8>,
@@ -410,23 +456,45 @@ fn whisper_transcribe_local_impl(
             resolve_bundled_resource_candidates(
                 app,
                 &[
-                    "ggml-tiny.en.bin",
+                    "ggml-large-v3.bin",
+                    "ggml-large-v3-turbo.bin",
+                    "ggml-medium.bin",
+                    "ggml-medium.en.bin",
+                    "ggml-base.bin",
                     "ggml-base.en.bin",
-                    "whisper/ggml-tiny.bin",
-                    "resources/whisper/ggml-tiny.bin",
-                    "whisper/ggml-tiny.en.bin",
-                    "resources/whisper/ggml-tiny.en.bin",
+                    "ggml-tiny.en.bin",
+                    "ggml-tiny.bin",
+                    "whisper/ggml-large-v3.bin",
+                    "resources/whisper/ggml-large-v3.bin",
+                    "whisper/ggml-large-v3-turbo.bin",
+                    "resources/whisper/ggml-large-v3-turbo.bin",
+                    "whisper/ggml-medium.bin",
+                    "resources/whisper/ggml-medium.bin",
+                    "whisper/ggml-medium.en.bin",
+                    "resources/whisper/ggml-medium.en.bin",
+                    "whisper/ggml-base.bin",
+                    "resources/whisper/ggml-base.bin",
                     "whisper/ggml-base.en.bin",
                     "resources/whisper/ggml-base.en.bin",
+                    "whisper/ggml-tiny.en.bin",
+                    "resources/whisper/ggml-tiny.en.bin",
+                    "whisper/ggml-tiny.bin",
+                    "resources/whisper/ggml-tiny.bin",
                 ],
                 &[
-                    "ggml-tiny.en.bin",
-                    "ggml-base.en.bin",
-                    "ggml-tiny.bin",
-                    "ggml-base.bin",
-                    "ggml-small.en.bin",
-                    "ggml-medium.en.bin",
                     "ggml-large-v3.bin",
+                    "ggml-large-v3-turbo.bin",
+                    "ggml-large-v2.bin",
+                    "ggml-large-v1.bin",
+                    "ggml-large.bin",
+                    "ggml-medium.bin",
+                    "ggml-medium.en.bin",
+                    "ggml-small.bin",
+                    "ggml-small.en.bin",
+                    "ggml-base.bin",
+                    "ggml-base.en.bin",
+                    "ggml-tiny.en.bin",
+                    "ggml-tiny.bin",
                 ],
             )
         })
@@ -439,12 +507,18 @@ fn whisper_transcribe_local_impl(
             None
         })
         .ok_or_else(|| {
-            "Whisper model path is missing. Set GREEPY_WHISPER_MODEL_PATH, pass modelPath, or bundle whisper/ggml-tiny.en.bin in app resources.".to_string()
+            "Whisper model path is missing. Set GREEPY_WHISPER_MODEL_PATH, pass modelPath, or select a larger local model file such as ggml-large-v3.bin.".to_string()
         })?;
+    if is_tiny_whisper_model_path(&resolved_model_path) {
+        return Err(
+            "Tiny Whisper models are disabled. Select a larger model such as ggml-large-v3.bin."
+                .to_string(),
+        );
+    }
 
     let resolved_language = resolve_non_empty(language)
         .or_else(|| resolve_non_empty(std::env::var("GREEPY_WHISPER_LANGUAGE").ok()))
-        .unwrap_or_else(|| "en".to_string());
+        .unwrap_or_else(|| "auto".to_string());
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -460,7 +534,8 @@ fn whisper_transcribe_local_impl(
         format!("Failed to write temporary audio file: {error}")
     })?;
 
-    let process_output = Command::new(&resolved_binary)
+    let mut whisper_command = Command::new(&resolved_binary);
+    whisper_command
         .arg("-m")
         .arg(&resolved_model_path)
         .arg("-f")
@@ -469,12 +544,17 @@ fn whisper_transcribe_local_impl(
         .arg(&resolved_language)
         .arg("-otxt")
         .arg("-of")
-        .arg(&output_base_path)
-        .output()
-        .map_err(|error| {
-            let _ = fs::remove_dir_all(&working_dir);
-            format!("Failed to launch whisper binary '{resolved_binary}': {error}")
-        })?;
+        .arg(&output_base_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        whisper_command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let process_output = whisper_command.output().map_err(|error| {
+        let _ = fs::remove_dir_all(&working_dir);
+        format!("Failed to launch whisper binary '{resolved_binary}': {error}")
+    })?;
 
     if !process_output.status.success() {
         let stderr = String::from_utf8_lossy(&process_output.stderr)

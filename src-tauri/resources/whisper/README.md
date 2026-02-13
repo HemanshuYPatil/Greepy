@@ -1,6 +1,5 @@
 Place bundled Whisper assets here for release builds:
 - whisper-cli.exe
-- ggml-tiny.en.bin
 - whisper/ggml runtime DLLs when using dynamic builds (for example: whisper.dll, ggml.dll, ggml-base.dll, ggml-cpu.dll)
 
-The GitHub release workflow can populate this folder automatically.
+Tiny Whisper models are disabled in the app. Keep your larger model (for example: ggml-large-v3.bin) in a local path and select it in-app when prompted.

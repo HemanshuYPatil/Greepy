@@ -2324,7 +2324,9 @@ function MainApp() {
 
   const tryResolveWhisperRequirements = useCallback(async (errorMessage: string) => {
     let updated = false;
-    const missingModel = errorMessage.includes("Whisper model path is missing");
+    const missingModel =
+      errorMessage.includes("Whisper model path is missing") ||
+      errorMessage.includes("Tiny Whisper models are disabled");
     const missingBinary =
       errorMessage.includes("Failed to launch whisper binary") ||
       errorMessage.includes("STATUS_DLL_NOT_FOUND") ||
