@@ -1527,6 +1527,7 @@ function MainApp() {
   const speechCtrlChordRef = useRef(false);
   const speechStartInFlightRef = useRef(false);
   const speechStartTokenRef = useRef(0);
+  const speechStopRequestedRef = useRef(false);
   const lastGlobalDropRef = useRef<{ paneId: string; payload: string; at: number } | null>(
     null,
   );
@@ -2455,11 +2456,13 @@ function MainApp() {
 
   const resetSpeechOverlay = useCallback(() => {
     speechChunksRef.current = [];
+    speechStopRequestedRef.current = false;
     setSpeechWaveLevels(createSpeechWaveLevels());
     setSpeechCaptureState("idle");
   }, []);
 
   const handleCancelSpeechCapture = useCallback(async () => {
+    speechStopRequestedRef.current = false;
     speechStartTokenRef.current += 1;
     speechStartInFlightRef.current = false;
     await cleanupSpeechCaptureResources();
@@ -2477,6 +2480,7 @@ function MainApp() {
     if (speechStartInFlightRef.current || speechRecordingRef.current) return;
     if (!isProjectReady || !activeId) return;
 
+    speechStopRequestedRef.current = false;
     speechStartInFlightRef.current = true;
     const startToken = speechStartTokenRef.current + 1;
     speechStartTokenRef.current = startToken;
@@ -2494,7 +2498,7 @@ function MainApp() {
       });
       audioContext = new AudioContext();
       await audioContext.resume();
-      if (!speechCtrlPressedRef.current || speechStartTokenRef.current !== startToken) {
+      if (speechStartTokenRef.current !== startToken) {
         return;
       }
 
@@ -2532,6 +2536,9 @@ function MainApp() {
       speechProcessorRef.current = processorNode;
       speechSilenceRef.current = silenceNode;
       setSpeechCaptureState("recording");
+      if (!speechCtrlPressedRef.current) {
+        speechStopRequestedRef.current = true;
+      }
     } catch {
       await cleanupSpeechCaptureResources();
       setSpeechWaveLevels(createSpeechWaveLevels());
@@ -2549,10 +2556,16 @@ function MainApp() {
         }
       }
     }
-  }, [activeId, cleanupSpeechCaptureResources, isProjectReady, speechCaptureState]);
+  }, [
+    activeId,
+    cleanupSpeechCaptureResources,
+    isProjectReady,
+    speechCaptureState,
+  ]);
 
   const handleStopSpeechCapture = useCallback(async () => {
-    if (speechCaptureState !== "recording") return;
+    if (!speechRecordingRef.current && speechCaptureState !== "recording") return;
+    speechStopRequestedRef.current = false;
     setSpeechCaptureState("transcribing");
     speechRecordingRef.current = false;
     speechStartTokenRef.current += 1;
@@ -2652,8 +2665,12 @@ function MainApp() {
       event.preventDefault();
       event.stopPropagation();
 
-      if (speechCaptureState === "recording") {
+      if (speechRecordingRef.current || speechCaptureState === "recording") {
         void handleStopSpeechCapture();
+        return;
+      }
+      if (speechStartInFlightRef.current) {
+        speechStopRequestedRef.current = true;
         return;
       }
       void handleCancelSpeechCapture();
@@ -2662,6 +2679,7 @@ function MainApp() {
     const resetSpeechCtrlState = () => {
       speechCtrlPressedRef.current = false;
       speechCtrlChordRef.current = false;
+      speechStopRequestedRef.current = false;
       setIsSpeechCtrlHeld(false);
       void handleCancelSpeechCapture();
     };
@@ -2680,6 +2698,13 @@ function MainApp() {
     handleStartSpeechCapture,
     handleStopSpeechCapture,
   ]);
+
+  useEffect(() => {
+    if (speechCaptureState !== "recording") return;
+    if (!speechStopRequestedRef.current) return;
+    speechStopRequestedRef.current = false;
+    void handleStopSpeechCapture();
+  }, [speechCaptureState, handleStopSpeechCapture]);
 
   useEffect(
     () => () => {
