@@ -2325,7 +2325,11 @@ function MainApp() {
   const tryResolveWhisperRequirements = useCallback(async (errorMessage: string) => {
     let updated = false;
     const missingModel = errorMessage.includes("Whisper model path is missing");
-    const missingBinary = errorMessage.includes("Failed to launch whisper binary");
+    const missingBinary =
+      errorMessage.includes("Failed to launch whisper binary") ||
+      errorMessage.includes("STATUS_DLL_NOT_FOUND") ||
+      errorMessage.includes("STATUS_INVALID_IMAGE_FORMAT") ||
+      errorMessage.includes("No process output captured.");
 
     if (missingModel) {
       const selectedModel = await open({

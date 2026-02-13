@@ -1,4 +1,4 @@
-﻿use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -193,16 +193,8 @@ fn collect_resource_search_roots(app: &tauri::AppHandle) -> Vec<PathBuf> {
 
     if let Ok(resource_dir) = app.path().resource_dir() {
         push_unique_existing_dir(&mut seen_dirs, &mut roots, resource_dir.clone());
-        push_unique_existing_dir(
-            &mut seen_dirs,
-            &mut roots,
-            resource_dir.join("whisper"),
-        );
-        push_unique_existing_dir(
-            &mut seen_dirs,
-            &mut roots,
-            resource_dir.join("resources"),
-        );
+        push_unique_existing_dir(&mut seen_dirs, &mut roots, resource_dir.join("whisper"));
+        push_unique_existing_dir(&mut seen_dirs, &mut roots, resource_dir.join("resources"));
         push_unique_existing_dir(
             &mut seen_dirs,
             &mut roots,
@@ -214,47 +206,27 @@ fn collect_resource_search_roots(app: &tauri::AppHandle) -> Vec<PathBuf> {
         if let Some(executable_dir) = executable_path.parent() {
             let executable_dir = executable_dir.to_path_buf();
             push_unique_existing_dir(&mut seen_dirs, &mut roots, executable_dir.clone());
-            push_unique_existing_dir(
-                &mut seen_dirs,
-                &mut roots,
-                executable_dir.join("whisper"),
-            );
-            push_unique_existing_dir(
-                &mut seen_dirs,
-                &mut roots,
-                executable_dir.join("resources"),
-            );
+            push_unique_existing_dir(&mut seen_dirs, &mut roots, executable_dir.join("whisper"));
+            push_unique_existing_dir(&mut seen_dirs, &mut roots, executable_dir.join("resources"));
             push_unique_existing_dir(
                 &mut seen_dirs,
                 &mut roots,
                 executable_dir.join("resources").join("whisper"),
             );
-            push_unique_existing_dir(
-                &mut seen_dirs,
-                &mut roots,
-                executable_dir.join("Resources"),
-            );
+            push_unique_existing_dir(&mut seen_dirs, &mut roots, executable_dir.join("Resources"));
             push_unique_existing_dir(
                 &mut seen_dirs,
                 &mut roots,
                 executable_dir.join("Resources").join("whisper"),
             );
             if let Some(parent_dir) = executable_dir.parent() {
-                push_unique_existing_dir(
-                    &mut seen_dirs,
-                    &mut roots,
-                    parent_dir.join("resources"),
-                );
+                push_unique_existing_dir(&mut seen_dirs, &mut roots, parent_dir.join("resources"));
                 push_unique_existing_dir(
                     &mut seen_dirs,
                     &mut roots,
                     parent_dir.join("resources").join("whisper"),
                 );
-                push_unique_existing_dir(
-                    &mut seen_dirs,
-                    &mut roots,
-                    parent_dir.join("Resources"),
-                );
+                push_unique_existing_dir(&mut seen_dirs, &mut roots, parent_dir.join("Resources"));
                 push_unique_existing_dir(
                     &mut seen_dirs,
                     &mut roots,
@@ -370,6 +342,39 @@ fn resolve_bundled_resource_candidates(
     None
 }
 
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        #[cfg(windows)]
+        {
+            let code_as_u32 = code as u32;
+            return format!("exit code {code} (0x{code_as_u32:08X})");
+        }
+        #[cfg(not(windows))]
+        {
+            return format!("exit code {code}");
+        }
+    }
+
+    "terminated by signal".to_string()
+}
+
+fn whisper_runtime_hint(status_code: Option<i32>) -> Option<&'static str> {
+    #[cfg(windows)]
+    if let Some(code) = status_code {
+        return match code as u32 {
+            0xC0000135 => Some(
+                "Windows reported STATUS_DLL_NOT_FOUND. Bundle whisper.cpp runtime DLLs (for example: whisper.dll, ggml.dll, ggml-base.dll, ggml-cpu.dll) beside whisper-cli.exe.",
+            ),
+            0xC000007B => Some(
+                "Windows reported STATUS_INVALID_IMAGE_FORMAT. Verify Whisper binary/DLL architecture matches the app (x64 vs x86).",
+            ),
+            _ => None,
+        };
+    }
+
+    None
+}
+
 fn whisper_transcribe_local_impl(
     app: &tauri::AppHandle,
     audio_bytes: Vec<u8>,
@@ -479,14 +484,29 @@ fn whisper_transcribe_local_impl(
             .trim()
             .to_string();
         let _ = fs::remove_dir_all(&working_dir);
-        let details = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "No process output captured.".to_string()
-        };
-        return Err(format!("Whisper transcription failed: {details}"));
+        let mut details = Vec::new();
+        details.push(format!(
+            "status: {}",
+            format_exit_status(&process_output.status)
+        ));
+        if !stderr.is_empty() {
+            details.push(format!("stderr: {stderr}"));
+        }
+        if !stdout.is_empty() {
+            details.push(format!("stdout: {stdout}"));
+        }
+        if stderr.is_empty() && stdout.is_empty() {
+            details.push("No process output captured.".to_string());
+        }
+        details.push(format!("binary: {resolved_binary}"));
+        details.push(format!("model: {resolved_model_path}"));
+        if let Some(hint) = whisper_runtime_hint(process_output.status.code()) {
+            details.push(hint.to_string());
+        }
+        return Err(format!(
+            "Whisper transcription failed: {}",
+            details.join(" | ")
+        ));
     }
 
     let transcript_file = output_base_path.with_extension("txt");

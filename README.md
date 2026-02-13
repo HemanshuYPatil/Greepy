@@ -68,6 +68,7 @@ Requirements:
 
 - `whisper-cli` binary
 - A local Whisper model file (recommended for speed: `ggml-tiny.en.bin`)
+- On Windows, keep Whisper runtime DLLs next to `whisper-cli.exe` when using dynamic builds (for example: `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`)
 
 Environment variables:
 

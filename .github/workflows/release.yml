@@ -87,6 +87,16 @@ jobs:
           }
           Copy-Item $cliPath (Join-Path $resourceDir "whisper-cli.exe") -Force
 
+          $cliDir = Split-Path -Parent $cliPath
+          $runtimeDlls = Get-ChildItem -Path $cliDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "^(whisper|ggml.*)\.dll$" }
+          foreach ($dll in $runtimeDlls) {
+            Copy-Item $dll.FullName (Join-Path $resourceDir $dll.Name) -Force
+          }
+          if (-not $runtimeDlls) {
+            Write-Host "No whisper/ggml runtime DLL sidecars found next to whisper-cli.exe; proceeding with current binary output."
+          }
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
